@@ -335,7 +335,11 @@ impl<'h> Agent<'h> {
         // Every frontend enters here, so busy time is measured here; a turn
         // that failed was still busy.
         let busy_since = Instant::now();
+        // A permission mode's budget is spent per turn, and this is the one
+        // place every frontend agrees a turn begins and ends.
+        self.permissions.begin_turn();
         let result = self.run_loop().await;
+        self.permissions.end_turn();
         if top_level {
             maki_otel::emit::active_time(busy_since.elapsed());
         }

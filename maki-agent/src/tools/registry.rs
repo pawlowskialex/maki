@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use crate::template::Vars;
 use crate::{BufferSnapshot, ToolOutput};
 
-use super::hook::ToolHook;
+use super::hook::{PermissionHook, ToolHook};
 use super::schema::sanitize_tool_input_schema;
 use super::{DescriptionContext, ToolContext};
 use crate::agent::AgentHook;
@@ -270,12 +270,15 @@ pub struct ToolRegistry {
     /// The agent loop's own slots. They live here because the registry is the
     /// one handle every run already carries.
     agent_hook: ArcSwapOption<Box<dyn AgentHook>>,
+    /// Whoever answers a permission prompt in the user's place.
+    permission_hook: ArcSwapOption<Box<dyn PermissionHook>>,
 }
 
 /// `ArcSwapOption` needs a sized payload, hence the `Box`. Auto-deref hides
 /// it at every call site.
 pub type InstalledHook = Arc<Box<dyn ToolHook>>;
 pub type InstalledAgentHook = Arc<Box<dyn AgentHook>>;
+pub type InstalledPermissionHook = Arc<Box<dyn PermissionHook>>;
 
 impl Default for ToolRegistry {
     fn default() -> Self {
@@ -295,6 +298,7 @@ impl ToolRegistry {
             tools: ArcSwap::from_pointee(Vec::new()),
             hook: ArcSwapOption::empty(),
             agent_hook: ArcSwapOption::empty(),
+            permission_hook: ArcSwapOption::empty(),
         }
     }
 
@@ -318,6 +322,18 @@ impl ToolRegistry {
 
     pub fn agent_hook(&self) -> Option<InstalledAgentHook> {
         self.agent_hook.load_full()
+    }
+
+    /// Same lifetime rule as [`Self::set_hook`].
+    pub fn set_permission_hook(&self, hook: impl PermissionHook) {
+        let boxed: Box<dyn PermissionHook> = Box::new(hook);
+        self.permission_hook.store(Some(Arc::new(boxed)));
+    }
+
+    /// `None` when nobody layers the decide slot, which is the common case:
+    /// every gated call asks, so the lookup has to stay the only cost.
+    pub fn permission_hook(&self) -> Option<InstalledPermissionHook> {
+        self.permission_hook.load_full().filter(|hook| hook.wraps())
     }
 
     /// The process-wide registry. Every tool in it comes from a Lua plugin

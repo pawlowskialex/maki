@@ -63,7 +63,7 @@ use maki_agent::{
     SharedMessages, SubagentInfo,
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
-use maki_config::{ModelPolicy, UiConfig};
+use maki_config::{MODE_OFF, ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, Key, KeymapReader,
     LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
@@ -122,6 +122,13 @@ const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports 
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";
 const FAST_OFF_MSG: &str = "Fast mode: off";
+const PERMISSION_MODE_OFF_MSG: &str = "Permission mode: off";
+const YOLO_ON_MSG: &str = "YOLO mode enabled";
+const YOLO_OFF_MSG: &str = "YOLO mode disabled";
+const PERMISSION_MODE_ON_PREFIX: &str = "Permission mode: ";
+const PERMISSION_MODES_PREFIX: &str = "Permission modes: ";
+const PERMISSION_MODES_NONE: &str =
+    "No permission modes defined — write a [modes.<name>] section in permissions.toml";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
@@ -529,8 +536,8 @@ impl App {
                 .collect(),
         );
         // The manager arrives forked from the prototype the process was
-        // started with, so a tab that resumes or spawns blank runs on
-        // `--yolo` until its own meta is read back here.
+        // started with, so a tab that resumes or spawns blank runs on the mode
+        // the flags asked for until its own meta is read back here.
         app.apply_stored_permissions(&app.state.session.meta);
         app
     }
@@ -1298,6 +1305,7 @@ impl App {
         if !self.chat_accepts_input() {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                KeyCode::BackTab => self.cycle_permission_mode(),
                 _ => vec![],
             };
         }
@@ -1345,6 +1353,7 @@ impl App {
                         vec![]
                     }
                     KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                    KeyCode::BackTab => self.cycle_permission_mode(),
                     KeyCode::Esc => self.handle_esc(streaming),
                     _ => vec![],
                 }
@@ -1844,14 +1853,13 @@ impl App {
                 vec![]
             }
             "/cd" => self.cmd_cd(&cmd.args),
+            "/permission" => self.cmd_permission_mode(cmd.args.trim()),
+            // The one-key gesture for the mode of the same name. It predates
+            // `/permission` and keeps working, checkpoint included.
             "/yolo" => {
                 let enabled = self.permissions.toggle_yolo();
-                let msg = if enabled {
-                    "YOLO mode enabled"
-                } else {
-                    "YOLO mode disabled"
-                };
-                self.flash(msg.into());
+                self.flash(if enabled { YOLO_ON_MSG } else { YOLO_OFF_MSG }.into());
+                self.checkpoint_now();
                 vec![]
             }
             "/fast" => {
@@ -2011,6 +2019,39 @@ impl App {
             text: cmd.render(args),
             images: Vec::new(),
         })
+    }
+
+    /// No argument lists what the config defines, `off` switches back to
+    /// asking, and a name switches to that mode.
+    fn cmd_permission_mode(&mut self, name: &str) -> Vec<Action> {
+        let modes = self.permissions.modes();
+        if name.is_empty() {
+            let active = self.permissions.active_mode_name();
+            let listed = modes
+                .iter()
+                .map(|mode| {
+                    let marker = if Some(&mode.name) == active.as_ref() {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    format!("{marker}{}", mode.name)
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            self.flash(if listed.is_empty() {
+                PERMISSION_MODES_NONE.into()
+            } else {
+                format!("{PERMISSION_MODES_PREFIX}{listed}")
+            });
+            return vec![];
+        }
+        let wanted = (name != MODE_OFF).then_some(name);
+        match self.permissions.set_mode(wanted) {
+            Ok(mode) => self.announce_permission_mode(mode.as_deref()),
+            Err(e) => self.flash(e.to_string()),
+        }
+        vec![]
     }
 
     fn cmd_cd(&mut self, args: &str) -> Vec<Action> {

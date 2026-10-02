@@ -431,7 +431,7 @@ fn start_session(
         resumed,
         claim: claim.clone(),
         storage: params.storage.clone(),
-        yolo: params.yolo,
+        permission_mode: params.permission_mode.clone(),
         system_prompt_override: None,
         append_system_prompt: None,
         defaults: params.defaults,
@@ -1085,7 +1085,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 mod tests {
     use std::sync::LazyLock;
 
-    use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
+    use maki_agent::permissions::{Gate, PermissionCheck, PermissionError, PermissionManager};
     use maki_agent::tools::PermissionScopes;
     use maki_agent::{
         CancelToken, DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent,
@@ -1360,7 +1360,7 @@ mod tests {
             timeouts: Timeouts::default(),
             initial_wd: PathBuf::from("/project"),
             prompt_slots: Arc::default(),
-            yolo: false,
+            permission_mode: None,
             defaults: SessionDefaults::default(),
             model_policy: Arc::default(),
             plugin_rules: Arc::default(),
@@ -1667,12 +1667,15 @@ mod tests {
         smol::block_on(session.handle.permissions.enforce(
             &ToolKey::native(NEXT_TURN_TOOL),
             &PermissionScopes::single(NEXT_TURN_SCOPE.to_owned()),
-            &event_tx,
-            Some(&rx),
-            request_id,
-            &CancelToken::none(),
-            None,
-            None,
+            Gate {
+                event_tx: &event_tx,
+                user_response_rx: Some(&rx),
+                request_id,
+                cancel: &CancelToken::none(),
+                plan_path: None,
+                ask: None,
+                decider: None,
+            },
         ))
     }
 
@@ -1693,7 +1696,7 @@ mod tests {
                 NEXT_TURN_SCOPE,
                 None
             ),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         )
     }
 

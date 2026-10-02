@@ -11,6 +11,7 @@ use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
+use crate::permissions::Gate;
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
 use crate::tools::registry::{InstalledHook, RegisteredTool, Tool, ToolInvocation};
@@ -849,12 +850,15 @@ async fn gate(
         .enforce(
             tool,
             scopes,
-            &ctx.event_tx,
-            ctx.user_response_rx.as_deref(),
-            id,
-            &ctx.cancel,
-            ctx.mode.plan_path(),
-            ask,
+            Gate {
+                event_tx: &ctx.event_tx,
+                user_response_rx: ctx.user_response_rx.as_deref(),
+                request_id: id,
+                cancel: &ctx.cancel,
+                plan_path: ctx.mode.plan_path(),
+                ask,
+                decider: ctx.registry.permission_hook(),
+            },
         )
         .await
         .map_err(|e| e.to_string())

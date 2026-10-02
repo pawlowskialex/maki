@@ -26,7 +26,9 @@ pub struct AcpParams {
     pub timeouts: Timeouts,
     pub initial_wd: PathBuf,
     pub prompt_slots: Arc<ResolvedSlots>,
-    pub yolo: bool,
+    /// The permission mode every session this server opens starts in, from
+    /// `--yolo` or `always_permission_mode`. ACP has no switch of its own.
+    pub permission_mode: Option<String>,
     /// ACP exposes no toggles of its own, so the `always_*` knobs are the whole
     /// answer for every prompt this server runs.
     pub defaults: SessionDefaults,

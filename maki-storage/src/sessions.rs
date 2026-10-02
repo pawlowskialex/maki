@@ -356,8 +356,15 @@ pub struct SessionMeta {
     pub fast: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workflow: bool,
-    /// `None` when the user never set yolo for this session, which is what
-    /// makes `--yolo` a property of the invocation rather than of the log.
+    /// The permission mode that was active, by name. A mode the config no
+    /// longer defines is dropped on restore rather than resurrected, which is
+    /// what makes the config the only place a mode is defined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    /// Read for sessions written before yolo became a permission mode, and no
+    /// longer written: `permission_mode` holds the answer now. An older maki
+    /// reading one of today's sessions sees no yolo, which costs that session
+    /// the grant rather than granting one nobody asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yolo: Option<bool>,
 }

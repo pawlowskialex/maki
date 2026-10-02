@@ -14,12 +14,13 @@ answered once per folder. See [folder trust](/docs/folder-trust/).
 
 ## Rule Layers
 
-Rules come from four layers, combined for resolution:
+Rules come from five layers, combined for resolution:
 
 1. **Session rules**, set during the current session (in-memory only)
 2. **Config rules**, loaded from TOML permission files
 3. **Builtin rules**, the hardcoded defaults
 4. **Plugin rules**, declared by plugins via [`maki.api.register_permission_rule`](/docs/lua-api/#maki-api-register_permission_rule)
+5. **Mode rules**, from the [permission mode](#permission-modes) you switched on, YOLO included
 
 Any matching deny blocks the tool. No exceptions, so a config deny always beats a plugin allow.
 
@@ -38,15 +39,19 @@ deny rule matches?  ── yes ──►  blocked. no exceptions
     │ no
 allow rule matches? ── yes ──►  runs
     │ no
-YOLO active?        ── yes ──►  runs
+mode allows it?     ── yes ──►  runs, and spends from the mode budget
     │ no
 plan file write?    ── yes ──►  runs
     │ no
+default says allow? ── yes ──►  runs
+    │ no
+decide slot answers? ─ yes ──►  runs, or is blocked, as the layer said
+    │ no
     ▼
-default: prompt / allow / deny
+Maki asks you
 ```
 
-Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow; this applies to the file-write tools only. All other tools, including MCP tools, follow the check flow below as usual. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
+Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by a permission mode (YOLO included), a decide layer, or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow; this applies to the file-write tools only. All other tools, including MCP tools, follow the check flow below as usual. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
 
 ## Builtin Defaults
 
@@ -193,9 +198,144 @@ When you pick "always allow" (or always deny for MCP), the saved scope is genera
 
 For MCP tools, both allow and deny decisions generalize to `*` (the entire tool). MCP inputs are opaque JSON with no meaningful scope pattern. Denying a single MCP invocation denies that tool until you revoke the rule.
 
+## Permission Modes
+
+A permission mode is a named bundle of rules you switch on for a while. It is
+how you get auto-accept behaviour without writing a standing rule into your
+config: the mode applies while it is on, and the rules in your file are what you
+fall back to.
+
+Write one as a `[modes.<name>]` section. The body takes everything the file
+itself takes, so a mode is read the same way the rest of your `permissions.toml`
+is:
+
+```toml
+# ~/.config/maki/permissions.toml
+[modes.auto]
+description = "Build and test without asking"
+max_auto_calls = 25
+revert_on_deny = true
+
+[modes.auto.bash]
+allow = ["cargo *", "git diff", "git status", "rg *"]
+deny = ["cargo publish *"]
+
+[modes.auto.edit]
+default = "allow"
+
+[modes.review]
+description = "Read the tree, change nothing"
+default = "deny"
+
+[modes.review.read]
+default = "allow"
+```
+
+### Switching modes
+
+| Gesture | Effect |
+|---------|--------|
+| `/permission` | List the modes, marking the active one with `*` |
+| `/permission auto` | Switch to `auto` |
+| `/permission off` | Switch back to asking |
+| `Shift+Tab` | Cycle through the modes and back to off |
+| `--permission-mode auto` | Start in `auto` |
+| `--yolo` | Start in the built-in `yolo` mode |
+
+The status bar shows the active mode, with its spend when the mode set a
+ceiling: `[auto 7/25]`. A mode you switched to is stored with the session, so a
+resume comes back in it, and switching off is stored too. `--permission-mode`
+only sets the starting value for sessions you never switched by hand, the same
+way `--yolo` does.
+
+`off` is how a mode is switched off, so a `[modes.off]` section is ignored.
+
+To start every session in a mode:
+
+```lua
+-- ~/.config/maki/init.lua
+maki.setup({
+    always_permission_mode = "auto",
+})
+```
+
+### Budget
+
+A mode is a standing grant, so it is worth bounding. Three optional keys do
+that:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `max_auto_calls` | unbounded | Calls this mode may wave through in one turn |
+| `revert_on_deny` | `false` | Switch the mode off when you deny a call |
+| `expires` | `"session"` | `"turn"` drops the mode when the turn ends |
+| `cycle` | `true` | `false` keeps the mode out of `Shift+Tab`, so it has to be named |
+
+Only the calls the mode decided count against `max_auto_calls`. A call an allow
+rule already covered costs nothing, and the counter resets at the start of each
+turn. A spent budget silences the mode's allows and leaves its denies in place,
+so running out of rope never loosens anything.
+
+### How a mode resolves
+
+A mode joins the rule layers rather than replacing them:
+
+- Any matching deny wins, including a deny the mode added.
+- An allow from your config, session, builtins or a plugin is checked first, and
+  costs the mode nothing.
+- Specific beats general, whoever wrote it. A mode's own `[modes.auto.bash]
+  default` outranks a `[bash] default` in the file, and a `[bash] default` in
+  the file outranks a mode's blanket `default`. So switching on a mode that
+  allows by default cannot quietly undo a `[bash] default = "deny"`.
+
+A project file may define modes, under the same limit as the rest of it: allow
+lists work once the folder is [trusted](/docs/folder-trust/), and
+`default = "allow"` is ignored, top-level or per-tool. A repository can narrow
+what runs inside it and never widen it.
+
+### Built-in modes
+
+Maki ships two, and they resolve in a config that never mentions modes:
+
+| Mode | Does |
+|------|------|
+| `accept_edits` | Lets the file-write tools write anywhere without asking |
+| `yolo` | Allows everything a deny rule does not catch. See [YOLO mode](#yolo-mode) |
+
+Defining `[modes.accept_edits]` or `[modes.yolo]` yourself replaces the built-in
+outright, inheriting none of its fields.
+
+In [SDK mode](/docs/headless/), `--permission-mode` and the `set_permission_mode`
+control request also take the four names that protocol defines. `acceptEdits` and
+`bypassPermissions` switch on the two modes above, `default` is no mode, and
+`plan` is [plan mode](/docs/quick-start/), which the TUI reaches with `Tab`.
+Those names work only there, since they are what SDK clients send on the wire.
+
+### Deciding in Lua
+
+When rules leave a call for you to answer, a plugin can answer in your place
+through the `permission.decide` slot. Use it for policy no rule can express, such
+as reading an allowlist from a file or counting what the agent has already done.
+See [hooks](/docs/hooks/#permission-decide).
+
 ## YOLO Mode
 
-To skip prompts on gated tools, toggle YOLO with `/yolo`, or run with `--yolo`. Explicit deny rules still apply. The status bar shows `[yolo]` while it is on, and `/yolo` is stored with the session, so a resume comes back the same way. `--yolo` only sets the starting value for sessions you never toggled. Tools that never declare permission scopes are unaffected (they never prompted).
+YOLO is a built-in permission mode whose one rule allows everything. Toggle it
+with `/yolo`, or start in it with `--yolo` or `--permission-mode
+bypassPermissions`. Explicit deny rules still apply. Tools that never declare
+permission scopes are unaffected, since they never prompted.
+
+Being a mode, it behaves like the ones you write: the status bar shows `[yolo]`,
+the answer is stored with the session so a resume comes back the same way, and
+`--yolo` only sets the starting value for sessions you never switched by hand.
+`/permission yolo` and `/permission off` do the same job as `/yolo`.
+
+It carries a rule rather than `default = "allow"`, which is what keeps it as
+strong as it has always been: a rule outranks every `default` in your file, so a
+`[bash] default = "deny"` does not hold it back. A mode you write with
+`default = "allow"` loses to that same per-tool default. `Shift+Tab` skips yolo
+for the same reason, so handing over everything stays something you ask for by
+name.
 
 To start in YOLO mode every time:
 

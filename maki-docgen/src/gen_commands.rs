@@ -78,7 +78,12 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "- **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`."
+        "- **`/permission`**: switch [permission mode](/docs/permissions/#permission-modes), the named rule bundles you write in `permissions.toml`. Bare it lists them, `off` goes back to asking, and `Shift+Tab` cycles. The mode survives a resume, and `--permission-mode` only sets the starting value. Config: `always_permission_mode`."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- **`/yolo`**: the one-key gesture for the built-in `yolo` mode, which skips permission prompts (deny rules still apply). The answer survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`."
     )
     .unwrap();
     writeln!(

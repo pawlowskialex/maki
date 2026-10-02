@@ -141,7 +141,8 @@ maki.api.set_slot("tool.bash.input", function(prev, input, ctx)
 end)
 ```
 
-The prompt appears even when an allow rule or yolo mode would let the call
+The prompt appears even when an allow rule or the active
+[permission mode](/docs/permissions/#permission-modes) would let the call
 through. A deny rule still wins. To ask about a rewritten call, return it
 first: `return input, { ask = reason }`. Other slots ignore `ask` with a warning
 and keep the rewrite.
@@ -328,6 +329,62 @@ end)
 
 Maki applies the pick itself, so a layer cannot split a tool call from its
 result.
+
+## permission.decide {#permission-decide}
+
+The gate fires one slot of its own. It runs when your rules leave a call for you
+to answer, and a layer that answers takes your place:
+
+| Slot | Fires | Gets |
+| --- | --- | --- |
+| `permission.decide` | when a gated call is about to raise the permission prompt | `{ effect }` |
+
+The value is the decision itself, so passing it down with `prev` reads as "no
+opinion" without having to know what maki would have done. Replace it to decide:
+
+```lua
+local ALLOWED = { ["cargo test"] = true, ["cargo check"] = true }
+
+maki.api.set_slot("permission.decide", function(prev, decision, ctx)
+  if ctx.tool == "bash" and ALLOWED[ctx.scopes[1]] then
+    return { effect = "allow" }
+  end
+  if ctx.tool == "webfetch" then
+    return { effect = "deny", reason = "Fetch through the proxy instead." }
+  end
+  return prev(decision, ctx)
+end)
+```
+
+`effect` is `"allow"`, `"deny"`, or `"prompt"`. On `deny` and `prompt`, `reason`
+is what the model reads or what the prompt shows. Returning `nil, reason` denies
+with that reason. An answer maki cannot read, a layer that throws, and a chain
+that runs out of time all leave the prompt where it was: you are the fallback for
+everything this slot does not settle.
+
+| `ctx` field | Meaning |
+| --- | --- |
+| `tool` | tool name, `server.tool` for an MCP tool |
+| `scopes` | what the call asked for: commands for `bash`, paths for a write, the input as JSON for an MCP tool |
+| `mode` | active [permission mode](/docs/permissions/#permission-modes), or `nil` |
+| `auto_calls` | calls the mode has waved through this turn |
+| `max_auto_calls` | the mode's ceiling, or `nil` |
+| `deadline_ms` | milliseconds left before the chain is dropped |
+
+Two limits keep this slot from being a way around the rules:
+
+- **It only ever replaces the prompt.** A deny rule has already won by the time
+  the slot fires, and a call an allow rule covered never reaches it.
+- **An escalated call is never handed to it.** A `tool.<name>.input` layer that
+  answered `{ ask = reason }` asked for the human, and no decider answers on
+  their behalf.
+
+A layer here needs every permission, like an `agent.*` layer, because granting
+is the most expensive thing a layer can do. The chain gets 30 seconds.
+
+An allow from this slot spends nothing from the active mode's budget. The mode
+pays for what the mode decided, and a plugin that wants a ceiling of its own can
+count calls itself.
 
 ## Completion sources
 

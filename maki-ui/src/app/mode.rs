@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::QueuedMessage;
 use crate::components::Status;
+use crate::components::status_bar::PermissionModeLabel;
 use crate::theme;
 use maki_agent::{AgentInput, AgentMode, InputSource};
+use maki_config::PermissionMode;
 use maki_storage::StateDir;
 use maki_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
@@ -123,6 +125,31 @@ impl App {
         vec![]
     }
 
+    /// Shift+Tab walks the configured permission modes and back off again, so
+    /// the whole set is reachable without naming one.
+    pub(super) fn cycle_permission_mode(&mut self) -> Vec<super::Action> {
+        let mode = self.permissions.cycle_mode();
+        self.announce_permission_mode(mode.as_deref());
+        vec![]
+    }
+
+    /// The one place a mode switch is reported and written down, so `/permission`
+    /// and Shift+Tab cannot say or save different things.
+    pub(super) fn announce_permission_mode(&mut self, mode: Option<&PermissionMode>) {
+        match mode {
+            None => self.flash(super::PERMISSION_MODE_OFF_MSG.into()),
+            Some(mode) => {
+                let detail = mode.description.as_deref().unwrap_or_default();
+                self.flash(format!(
+                    "{}{} {detail}",
+                    super::PERMISSION_MODE_ON_PREFIX,
+                    mode.name
+                ));
+            }
+        }
+        self.checkpoint_now();
+    }
+
     pub(super) fn agent_mode(&self) -> AgentMode {
         match self.state.mode {
             Mode::Plan => match self.state.plan.path() {
@@ -164,6 +191,19 @@ impl App {
             .fg(self.effective_mode_color())
             .add_modifier(Modifier::BOLD);
         (label, style)
+    }
+
+    /// What the status bar says about the active permission mode. `None` when
+    /// no mode is on, which is the state where every gated call still asks.
+    pub(super) fn permission_mode_label(&self) -> Option<PermissionModeLabel> {
+        let mode = self.permissions.active_mode()?;
+        let (auto_calls, max_auto_calls) = self.permissions.mode_spend();
+        Some(PermissionModeLabel {
+            name: mode.name.clone(),
+            auto_calls,
+            max_auto_calls,
+            alarming: mode.grants_everything(),
+        })
     }
 
     pub(crate) fn is_bash_input(&self) -> bool {

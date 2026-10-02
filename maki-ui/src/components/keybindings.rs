@@ -378,6 +378,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single("Shift+Tab"),
+        description: "Cycle permission mode",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("/command"),
         description: "Open command palette",
         context: KeybindContext::Editing,

@@ -25,8 +25,10 @@ const CWD_MODEL_SEPARATOR: &str = "  ";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 const RESTRICTED_LABEL: &str = " [restricted]";
-const YOLO_LABEL: &str = " [yolo]";
-const YOLO_DIM_FACTOR: f32 = 0.15;
+/// A mode that hands over everything is drawn in the error colour, one notch
+/// off full strength. A mode that named what it covers gets the plan colour.
+const ALARM_DIM_FACTOR: f32 = 0.15;
+const MODE_DIM_FACTOR: f32 = 0.25;
 
 pub struct UsageStats {
     /// The whole session's bill, drawn next to the focused chat's own once
@@ -60,8 +62,28 @@ pub struct StatusBarContext<'a> {
     /// the question, not from `!is_trusted()`, which is true in every folder
     /// with no `.maki` at all.
     pub restricted: bool,
-    pub yolo: bool,
+    /// Name of the active permission mode, and what it has of its budget left.
+    pub permission_mode: Option<PermissionModeLabel>,
     pub restoring: bool,
+}
+
+/// What the bar says about the active permission mode: its name, plus the spend
+/// when the mode set itself a ceiling.
+pub struct PermissionModeLabel {
+    pub name: String,
+    pub auto_calls: u32,
+    pub max_auto_calls: Option<u32>,
+    /// The mode waves through anything a deny rule does not catch.
+    pub alarming: bool,
+}
+
+impl PermissionModeLabel {
+    fn text(&self) -> String {
+        match self.max_auto_calls {
+            Some(max) => format!(" [{} {}/{max}]", self.name, self.auto_calls),
+            None => format!(" [{}]", self.name),
+        }
+    }
 }
 
 pub struct StatusBar {
@@ -220,20 +242,22 @@ impl StatusBar {
 
         let mut right_spans = Vec::new();
 
-        // An error takes the whole bar over. The label saying the agent
-        // approves everything has to survive that, so it is built out here
-        // and both arms place it.
-        let yolo_span = ctx.yolo.then(|| {
-            Span::styled(
-                YOLO_LABEL,
-                theme::dim_style(theme::current().error, YOLO_DIM_FACTOR),
-            )
+        // An error takes the whole bar over. The label saying what the agent may
+        // do without asking has to survive that, so it is built out here and
+        // both arms place it.
+        let mode_span = ctx.permission_mode.as_ref().map(|mode| {
+            let style = if mode.alarming {
+                theme::dim_style(theme::current().error, ALARM_DIM_FACTOR)
+            } else {
+                theme::dim_style(Style::new().fg(theme::current().mode_plan), MODE_DIM_FACTOR)
+            };
+            Span::styled(mode.text(), style)
         });
 
         match ctx.status {
             Status::Error { message: e, .. } => {
                 left_spans.push(Span::styled(format!(" {e}"), theme::current().error));
-                right_spans.extend(yolo_span);
+                right_spans.extend(mode_span);
             }
             _ => {
                 let pct = if ctx.stats.context_window > 0 {
@@ -260,7 +284,7 @@ impl StatusBar {
                 if ctx.restricted {
                     rest_spans.push(Span::styled(RESTRICTED_LABEL, theme::current().status_dim));
                 }
-                rest_spans.extend(yolo_span);
+                rest_spans.extend(mode_span);
 
                 let context_text = format!(
                     "  {}/{} ({}%)",
@@ -443,6 +467,7 @@ mod tests {
     const STALE_BRANCH: &str = "/nowhere:gone";
     const BAR_WIDTH: u16 = 120;
     const MODEL_ID: &str = "test-model";
+    const MODE_NAME: &str = "yolo";
     const CONTEXT_SIZE: u32 = 12_000;
     const CHAT_COST: f64 = 0.25;
     const CHAT_COST_TEXT: &str = "$0.250";
@@ -455,17 +480,17 @@ mod tests {
     /// Long enough that the countdown cannot lapse mid-render.
     const RETRY_DELAY: Duration = Duration::from_secs(600);
 
-    fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
-        render_status(&Status::Idle, global_cost, show_global, yolo)
+    fn render(global_cost: Option<f64>, show_global: bool, mode: bool) -> String {
+        render_status(&Status::Idle, global_cost, show_global, mode)
     }
 
     fn render_status(
         status: &Status,
         global_cost: Option<f64>,
         show_global: bool,
-        yolo: bool,
+        mode: bool,
     ) -> String {
-        draw(&context(status, global_cost, show_global, yolo))
+        draw(&context(status, global_cost, show_global, mode))
     }
 
     fn draw(ctx: &StatusBarContext<'_>) -> String {
@@ -480,7 +505,7 @@ mod tests {
         status: &'a Status,
         global_cost: Option<f64>,
         show_global: bool,
-        yolo: bool,
+        mode: bool,
     ) -> StatusBarContext<'a> {
         StatusBarContext {
             status,
@@ -503,7 +528,12 @@ mod tests {
             fast: false,
             workflow: false,
             restricted: false,
-            yolo,
+            permission_mode: mode.then(|| PermissionModeLabel {
+                name: MODE_NAME.to_owned(),
+                auto_calls: 0,
+                max_auto_calls: None,
+                alarming: true,
+            }),
             restoring: false,
         }
     }
@@ -542,22 +572,36 @@ mod tests {
         shown
     }
 
-    /// Yolo now outlives the process that turned it on, so the one-shot flash
-    /// is no longer enough to tell the user their prompts are being skipped.
-    #[test_case(true  => true  ; "a_bypassed_session_says_so")]
+    /// A mode outlives the process that turned it on, so the one-shot flash is
+    /// no longer enough to tell the user what runs without asking.
+    #[test_case(true  => true  ; "a_session_in_a_mode_says_so")]
     #[test_case(false => false ; "a_prompting_session_stays_quiet")]
-    fn the_bar_advertises_yolo(yolo: bool) -> bool {
-        render(None, false, yolo).contains(YOLO_LABEL.trim())
+    fn the_bar_advertises_the_mode(mode: bool) -> bool {
+        render(None, false, mode).contains(MODE_NAME)
     }
 
     #[test]
-    fn an_error_does_not_hide_yolo() {
+    fn an_error_does_not_hide_the_mode() {
         let status = Status::Error {
             message: "something went wrong".into(),
             since: Instant::now(),
         };
         let text = render_status(&status, None, false, true);
-        assert!(text.contains(YOLO_LABEL.trim()), "{text}");
+        assert!(text.contains(MODE_NAME), "{text}");
+    }
+
+    /// A budget is why the label is worth the width: it says how much of the
+    /// standing grant is left.
+    #[test_case(None     => format!(" [{MODE_NAME}]")      ; "no_ceiling_names_the_mode")]
+    #[test_case(Some(25) => format!(" [{MODE_NAME} 7/25]") ; "a_ceiling_shows_the_spend")]
+    fn the_mode_label_shows_what_is_left(max_auto_calls: Option<u32>) -> String {
+        PermissionModeLabel {
+            name: MODE_NAME.to_owned(),
+            auto_calls: 7,
+            max_auto_calls,
+            alarming: false,
+        }
+        .text()
     }
 
     #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]

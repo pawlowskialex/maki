@@ -2,14 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use maki_config::{
-    DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
-    ProjectConfig, ToolKey, append_permission_rule,
+    BUILTIN_MODE_YOLO, DefaultEffect, Effect, FILE_WRITE_TOOLS, MODE_OFF, ModeExpiry,
+    PermissionMode, PermissionRule, PermissionTarget, PermissionsConfig, ProjectConfig, ToolKey,
+    append_permission_rule,
 };
 use thiserror::Error;
 use tracing::{info, warn};
 
+use crate::tools::hook::{Decision, PermissionCall};
+use crate::tools::registry::InstalledPermissionHook;
 use crate::{AgentEvent, EventSender};
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
@@ -21,10 +25,18 @@ pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied for";
 /// Values for the `source` attribute on `maki.tool_decision` events.
 pub const DECISION_SOURCE_RULE: &str = "rule";
 pub const DECISION_SOURCE_YOLO: &str = "yolo";
+pub const DECISION_SOURCE_MODE: &str = "mode";
+pub const DECISION_SOURCE_PLAN: &str = "plan";
+pub const DECISION_SOURCE_DEFAULT: &str = "default";
+pub const DECISION_SOURCE_DECIDE: &str = "decide";
 pub const DECISION_SOURCE_USER_ONCE: &str = "user_once";
 pub const DECISION_SOURCE_USER_SESSION: &str = "user_session";
 pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
 pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
+
+/// A decider may read a file or run a job before it answers, but the user is
+/// waiting on it. Past this the prompt goes up as if nobody had an opinion.
+const DECIDE_CHAIN_MAX: Duration = Duration::from_secs(30);
 
 const TASK_TOOL: &str = "task";
 const BASH_TOOL: &str = "bash";
@@ -71,9 +83,37 @@ pub fn carries_builtin_defaults(tool: &str) -> bool {
     FILE_WRITE_TOOLS.contains(&tool) || matches!(tool, TASK_TOOL | BASH_TOOL)
 }
 
+/// What settled an allow. The mode budget is spent by exactly the calls the
+/// mode waved through, so the answer has to name its source rather than be
+/// guessed at afterwards from whatever flags happen to be set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowSource {
+    /// A rule, from any layer but the active mode.
+    Rule,
+    Mode,
+    /// The write that drafts the plan, in plan mode.
+    Plan,
+    /// A `default` that is not the mode's own.
+    Default,
+    /// A plugin answering the prompt in the user's place.
+    Decide,
+}
+
+impl AllowSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rule => DECISION_SOURCE_RULE,
+            Self::Mode => DECISION_SOURCE_MODE,
+            Self::Plan => DECISION_SOURCE_PLAN,
+            Self::Default => DECISION_SOURCE_DEFAULT,
+            Self::Decide => DECISION_SOURCE_DECIDE,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PermissionCheck {
-    Allowed,
+    Allowed(AllowSource),
     Denied,
     NeedsPrompt {
         tool: ToolKey,
@@ -120,6 +160,21 @@ impl PermissionError {
             guidance: Some(guidance),
         }
     }
+}
+
+/// Everything the gate needs that is not the call itself.
+pub struct Gate<'a> {
+    pub event_tx: &'a EventSender,
+    pub user_response_rx: Option<&'a async_lock::Mutex<flume::Receiver<String>>>,
+    pub request_id: &'a str,
+    pub cancel: &'a crate::CancelToken,
+    pub plan_path: Option<&'a Path>,
+    /// A plugin's reason to show this call to the user whatever the rules say.
+    /// See [`PermissionManager::check_escalated`].
+    pub ask: Option<&'a str>,
+    /// Whoever may answer the prompt in the user's place, when nothing
+    /// escalated the call. `None` when no plugin layers the decide slot.
+    pub decider: Option<InstalledPermissionHook>,
 }
 
 /// How squarely an approval names the tool being checked. Every source of
@@ -302,22 +357,55 @@ impl PluginRuleStore {
     }
 }
 
+/// The mode the user switched on, with what it has spent of its budget. The
+/// count is per turn, because that is the unit the user watches go by.
+struct ActiveMode {
+    mode: Arc<PermissionMode>,
+    auto_calls: u32,
+}
+
+impl ActiveMode {
+    fn new(mode: Arc<PermissionMode>) -> Self {
+        Self {
+            mode,
+            auto_calls: 0,
+        }
+    }
+
+    /// Whether the mode may still wave a call through. A spent budget silences
+    /// only its allows: a mode that denies or asks goes on doing so, since
+    /// running out of rope is no reason to loosen it.
+    fn may_allow(&self) -> bool {
+        self.mode
+            .max_auto_calls
+            .is_none_or(|max| self.auto_calls < max)
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("no permission mode named '{0}'")]
+pub struct UnknownMode(pub String);
+
 pub struct PermissionManager {
     session_rules: Mutex<Vec<PermissionRule>>,
     config_rules: Vec<PermissionRule>,
     builtin_rules: Vec<PermissionRule>,
-    yolo: AtomicBool,
-    /// Whether the user set yolo for this session themselves, which is what
-    /// makes it worth persisting.
-    yolo_explicit: AtomicBool,
-    /// What `--yolo` / `always_yolo` seeded `yolo` with, so a session with no
-    /// stored intent falls back to the flag instead of to off.
-    seed_yolo: bool,
     default: DefaultEffect,
     tool_defaults: HashMap<ToolKey, DefaultEffect>,
     cwd: PathBuf,
     project_config: ProjectConfig,
     plugin_rules: Arc<PluginRuleStore>,
+    /// Every mode the config defines, sorted by name: what `/permission` lists
+    /// and what cycling walks.
+    modes: Vec<Arc<PermissionMode>>,
+    active_mode: Mutex<Option<ActiveMode>>,
+    /// What `--permission-mode` / `always_permission_mode` asked for. A session
+    /// that never said anything about modes falls back to it, which is what
+    /// keeps the flag a property of the invocation rather than of the log.
+    seed_mode: Option<Arc<PermissionMode>>,
+    /// Whether the user switched modes in this session themselves, which is
+    /// what makes the answer worth storing.
+    mode_explicit: AtomicBool,
 }
 
 impl PermissionManager {
@@ -329,6 +417,11 @@ impl PermissionManager {
     ) -> Self {
         let config_rules = config.rules;
         let builtin_rules = builtin_rules(&cwd);
+        let seed_mode = config
+            .initial_mode
+            .as_deref()
+            .and_then(|name| config.modes.iter().find(|mode| mode.name == name))
+            .cloned();
 
         // Warn if wildcard deny is present — it blocks ALL tools including builtins.
         let has_wildcard_deny = config_rules
@@ -357,33 +450,172 @@ impl PermissionManager {
             builtin_rules,
             session_rules: Mutex::new(Vec::new()),
             config_rules,
-            yolo: AtomicBool::new(config.yolo),
-            yolo_explicit: AtomicBool::new(false),
-            seed_yolo: config.yolo,
             default: config.default,
             tool_defaults: config.tool_defaults,
             cwd,
             project_config,
             plugin_rules,
+            active_mode: Mutex::new(seed_mode.clone().map(ActiveMode::new)),
+            seed_mode,
+            mode_explicit: AtomicBool::new(false),
+            modes: config.modes,
         }
     }
 
     /// Fresh manager for a new session runtime: shares config and builtin
-    /// rules plus the current yolo state, but owns empty session rules so
-    /// restoring one session never clobbers another's grants.
+    /// rules plus the active mode, but owns empty session rules so restoring
+    /// one session never clobbers another's grants.
     pub fn fork(&self) -> Self {
         Self {
             session_rules: Mutex::new(Vec::new()),
+            modes: self.modes.clone(),
+            // The mode carries over, its spending does not: a budget is per
+            // turn, and the forked session is about to run turns of its own.
+            active_mode: Mutex::new(self.active_mode().map(ActiveMode::new)),
+            seed_mode: self.seed_mode.clone(),
+            mode_explicit: AtomicBool::new(self.mode_explicit.load(Ordering::Relaxed)),
             config_rules: self.config_rules.clone(),
             builtin_rules: self.builtin_rules.clone(),
-            yolo: AtomicBool::new(self.is_yolo()),
-            yolo_explicit: AtomicBool::new(self.yolo_explicit.load(Ordering::Relaxed)),
-            seed_yolo: self.seed_yolo,
             default: self.default,
             tool_defaults: self.tool_defaults.clone(),
             cwd: self.cwd.clone(),
             project_config: self.project_config.clone(),
             plugin_rules: Arc::clone(&self.plugin_rules),
+        }
+    }
+
+    fn active(&self) -> std::sync::MutexGuard<'_, Option<ActiveMode>> {
+        self.active_mode.lock().unwrap_or_else(|e| {
+            warn!("permission mode mutex was poisoned, recovering");
+            e.into_inner()
+        })
+    }
+
+    /// Every mode the config defines, in the order `/permission` lists them.
+    pub fn modes(&self) -> &[Arc<PermissionMode>] {
+        &self.modes
+    }
+
+    pub fn active_mode(&self) -> Option<Arc<PermissionMode>> {
+        self.active().as_ref().map(|a| Arc::clone(&a.mode))
+    }
+
+    pub fn active_mode_name(&self) -> Option<String> {
+        self.active_mode().map(|mode| mode.name.clone())
+    }
+
+    /// `None` switches every mode off. A name nobody defined is refused rather
+    /// than ignored, so a typo in a flag or a config does not read as "off".
+    pub fn set_mode(&self, name: Option<&str>) -> Result<Option<Arc<PermissionMode>>, UnknownMode> {
+        let mode = match name {
+            None => None,
+            Some(name) => Some(
+                self.modes
+                    .iter()
+                    .find(|m| m.name == name)
+                    .ok_or_else(|| UnknownMode(name.to_owned()))?,
+            ),
+        };
+        self.mode_explicit.store(true, Ordering::Relaxed);
+        let mode = self.install(mode.cloned());
+        info!(mode = ?mode.as_ref().map(|m| &m.name), "permission mode set");
+        Ok(mode)
+    }
+
+    /// What a session stores about its mode: the name it was switched to, the
+    /// off sentinel when the user switched it off, and nothing at all when they
+    /// never touched it, so the seed still speaks for the next session.
+    pub fn persisted_mode(&self) -> Option<String> {
+        if !self.mode_explicit.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(
+            self.active_mode_name()
+                .unwrap_or_else(|| MODE_OFF.to_owned()),
+        )
+    }
+
+    /// Hands a session's stored answer back. `None` is "this session never
+    /// said", which falls back to the seed rather than to off.
+    pub fn set_session_mode(&self, stored: Option<&str>) -> Result<(), UnknownMode> {
+        match stored {
+            None => {
+                self.mode_explicit.store(false, Ordering::Relaxed);
+                self.install(self.seed_mode.clone());
+                Ok(())
+            }
+            Some(MODE_OFF) => {
+                self.set_mode(None)?;
+                Ok(())
+            }
+            Some(name) => self.set_mode(Some(name)).map(|_| ()),
+        }
+    }
+
+    /// The one writer of the active mode, so a switch cannot forget to reset
+    /// the budget the new mode starts with.
+    fn install(&self, mode: Option<Arc<PermissionMode>>) -> Option<Arc<PermissionMode>> {
+        let active = mode.map(ActiveMode::new);
+        let mode = active.as_ref().map(|a| Arc::clone(&a.mode));
+        *self.active() = active;
+        mode
+    }
+
+    /// The next mode in the list, wrapping through "no mode" so cycling can
+    /// always get back to prompting for everything.
+    pub fn cycle_mode(&self) -> Option<Arc<PermissionMode>> {
+        let next = match self.active_mode_name() {
+            None => self.modes.first(),
+            Some(current) => self
+                .modes
+                .iter()
+                .position(|m| m.name == current)
+                .and_then(|i| self.modes.get(i + 1)),
+        };
+        self.mode_explicit.store(true, Ordering::Relaxed);
+        self.install(next.cloned())
+    }
+
+    /// What the mode has waved through this turn, and its ceiling.
+    pub fn mode_spend(&self) -> (u32, Option<u32>) {
+        match self.active().as_ref() {
+            Some(active) => (active.auto_calls, active.mode.max_auto_calls),
+            None => (0, None),
+        }
+    }
+
+    /// A fresh budget for a new turn. Nothing else about the mode resets.
+    pub fn begin_turn(&self) {
+        if let Some(active) = self.active().as_mut() {
+            active.auto_calls = 0;
+        }
+    }
+
+    /// Drops a mode that was only meant to last the turn.
+    pub fn end_turn(&self) {
+        let mut active = self.active();
+        if active
+            .as_ref()
+            .is_some_and(|a| a.mode.expires == ModeExpiry::Turn)
+        {
+            info!(mode = ?active.as_ref().map(|a| &a.mode.name), "permission mode expired with the turn");
+            *active = None;
+        }
+    }
+
+    fn charge_mode(&self) {
+        if let Some(active) = self.active().as_mut() {
+            active.auto_calls = active.auto_calls.saturating_add(1);
+        }
+    }
+
+    /// The user said no while a mode was on. A mode that asked to be dropped
+    /// over that is dropped: the human just contradicted the standing grant.
+    fn note_user_deny(&self) {
+        let mut active = self.active();
+        if active.as_ref().is_some_and(|a| a.mode.revert_on_deny) {
+            info!(mode = ?active.as_ref().map(|a| &a.mode.name), "permission mode reverted on a denial");
+            *active = None;
         }
     }
 
@@ -395,8 +627,10 @@ impl PermissionManager {
     }
 
     /// The order of the checks below is the policy itself, not an accident of
-    /// how it was written: denies first, then yolo, then explicit allows, the
-    /// plan file write, and last the defaults. Moving one moves the rules.
+    /// how it was written: denies first, then explicit allows, the plan file
+    /// write, and last the defaults. Moving one moves the rules. Yolo is a mode
+    /// whose one rule allows everything, so it lands in the allow pass with the
+    /// rest rather than in a step of its own.
     /// Every approval among them goes through [`ApprovalGate`], which is what
     /// keeps plan mode's hold from depending on which one happens to run first.
     fn check_inner(
@@ -408,6 +642,16 @@ impl PermissionManager {
     ) -> PermissionCheck {
         let session = self.session_rules();
         let plugin = self.plugin_rules.snapshot();
+        // Taken as a snapshot: the mode can be switched off while a call waits
+        // on the prompt, and a call has to be judged by one policy throughout.
+        let mode = self
+            .active()
+            .as_ref()
+            .map(|active| (Arc::clone(&active.mode), active.may_allow()));
+        let (mode_rules, mode_may_allow) = match &mode {
+            Some((mode, may_allow)) => (mode.rules.as_slice(), *may_allow),
+            None => ([].as_slice(), false),
+        };
 
         let gate = ApprovalGate::new(tool, plan_path);
 
@@ -420,13 +664,18 @@ impl PermissionManager {
             Vec::with_capacity(scopes.len())
         };
 
+        // Only set when the mode is the reason a scope passed, so a mode riding
+        // along with rules that already allowed the call spends nothing.
+        let mut mode_allowed = false;
         for scope in scopes {
             let mut has_allow = false;
-            for r in session
+            for (r, from_mode) in session
                 .iter()
                 .chain(&self.config_rules)
                 .chain(&self.builtin_rules)
                 .chain(&plugin)
+                .map(|r| (r, false))
+                .chain(mode_rules.iter().map(|r| (r, true)))
             {
                 let Some(approval) = rule_reach(&r.tool, tool) else {
                     continue;
@@ -436,8 +685,17 @@ impl PermissionManager {
                 }
                 match r.effect {
                     Effect::Deny => {
-                        info!(tool = %tool, scope = %scope, "permission denied");
+                        info!(tool = %tool, scope = %scope, from_mode, "permission denied");
                         return PermissionCheck::Denied;
+                    }
+                    // A mode allow counts only while the budget lasts, and
+                    // only when nothing else covered the scope already, since
+                    // what the mode did not decide it does not pay for.
+                    Effect::Allow if from_mode => {
+                        if mode_may_allow && !has_allow && gate.accepts(approval) {
+                            has_allow = true;
+                            mode_allowed = true;
+                        }
                     }
                     Effect::Allow => has_allow |= gate.accepts(approval),
                 }
@@ -451,10 +709,6 @@ impl PermissionManager {
             // force_prompt: all scopes will be prompted anyway
         }
 
-        if self.yolo.load(Ordering::Relaxed) && gate.accepts(Approval::Standing) {
-            return PermissionCheck::Allowed;
-        }
-
         let pending: Vec<&str> = if force_prompt {
             scopes.to_vec()
         } else {
@@ -462,7 +716,11 @@ impl PermissionManager {
         };
 
         if pending.is_empty() {
-            return PermissionCheck::Allowed;
+            return PermissionCheck::Allowed(if mode_allowed {
+                AllowSource::Mode
+            } else {
+                AllowSource::Rule
+            });
         }
 
         // Plan file auto-allow: fires AFTER deny rules have been evaluated.
@@ -479,33 +737,43 @@ impl PermissionManager {
                     }
             });
             if is_plan_write {
-                return PermissionCheck::Allowed;
+                return PermissionCheck::Allowed(AllowSource::Plan);
             }
         }
 
-        let eff = self
-            .tool_defaults
-            .get(tool)
-            .copied()
+        // Specific beats general, whoever wrote it: a mode's own per-tool
+        // default outranks the file's, and the file's per-tool default outranks
+        // the mode's blanket one. So switching on a mode that allows by default
+        // cannot quietly undo a `[bash] default = "deny"`.
+        let mode = mode.map(|(mode, _)| mode);
+        // A spent budget passes the mode's allows by and leaves its denies in
+        // place, the same way it treats the mode's rules.
+        let usable = |eff: &DefaultEffect| mode_may_allow || *eff != DefaultEffect::Allow;
+        let (eff, from_mode) = mode
+            .as_deref()
+            .and_then(|m| lookup_default(&m.tool_defaults, tool))
+            .filter(usable)
+            .map(|eff| (eff, true))
+            .or_else(|| lookup_default(&self.tool_defaults, tool).map(|eff| (eff, false)))
             .or_else(|| {
-                // McpTool falls back to McpServer-level default (Arc clone, ~2ns)
-                let server = match tool {
-                    ToolKey::McpTool { server, .. } => server,
-                    _ => return None,
-                };
-                self.tool_defaults
-                    .get(&ToolKey::McpServer {
-                        server: server.clone(),
-                    })
-                    .copied()
+                mode.as_deref()?
+                    .default
+                    .filter(usable)
+                    .map(|eff| (eff, true))
             })
-            .unwrap_or(self.default);
+            .unwrap_or((self.default, false));
         match eff {
             DefaultEffect::Deny => {
-                info!(tool = %tool, "denied by default");
+                info!(tool = %tool, from_mode, "denied by default");
                 PermissionCheck::Denied
             }
-            DefaultEffect::Allow if gate.accepts(Approval::Standing) => PermissionCheck::Allowed,
+            DefaultEffect::Allow if gate.accepts(Approval::Standing) => {
+                PermissionCheck::Allowed(if from_mode {
+                    AllowSource::Mode
+                } else {
+                    AllowSource::Default
+                })
+            }
             DefaultEffect::Allow | DefaultEffect::Prompt => PermissionCheck::NeedsPrompt {
                 tool: tool.clone(),
                 scopes: pending.into_iter().map(|s| s.to_string()).collect(),
@@ -538,39 +806,26 @@ impl PermissionManager {
         }
     }
 
-    /// The explicit toggle, so it also claims the session's intent: `/yolo` off
-    /// under `--yolo` genuinely turns the session off and is remembered.
+    /// `/yolo` is the one-key gesture for the mode of the same name: on when it
+    /// is not active, off when it is. Returns whether it ended up on.
     pub fn toggle_yolo(&self) -> bool {
-        let enabled = !self.yolo.fetch_xor(true, Ordering::Relaxed);
-        self.yolo_explicit.store(true, Ordering::Relaxed);
-        enabled
-    }
-
-    /// Replaces whatever this session was running with: `Some` is the user's
-    /// stored intent, `None` means they never expressed one and the seed
-    /// applies again.
-    pub fn set_session_yolo(&self, stored: Option<bool>) {
-        self.yolo
-            .store(stored.unwrap_or(self.seed_yolo), Ordering::Relaxed);
-        self.yolo_explicit
-            .store(stored.is_some(), Ordering::Relaxed);
+        let on = self.active_mode_name().as_deref() != Some(BUILTIN_MODE_YOLO);
+        let wanted = on.then_some(BUILTIN_MODE_YOLO);
+        match self.set_mode(wanted) {
+            Ok(_) => on,
+            // Only a config that redefined the built-in away can land here, and
+            // a gesture that cannot grant anything leaves the gate as it was.
+            Err(e) => {
+                warn!(error = %e, "nothing to toggle: no mode named {BUILTIN_MODE_YOLO}");
+                !on
+            }
+        }
     }
 
     pub fn is_yolo(&self) -> bool {
-        self.yolo.load(Ordering::Relaxed)
+        self.active_mode_name().as_deref() == Some(BUILTIN_MODE_YOLO)
     }
 
-    /// What the session may persist. A one-shot `--yolo` is a property of the
-    /// invocation, so on its own it stores nothing.
-    pub fn persisted_yolo(&self) -> Option<bool> {
-        self.yolo_explicit
-            .load(Ordering::Relaxed)
-            .then(|| self.is_yolo())
-    }
-
-    /// Outside-cwd paths are not blocked here. They flow through the normal
-    /// permission prompt (which uses the same canonicalization via
-    /// [`scope_matches`]). Only unresolvable boundaries are hard-blocked.
     pub fn boundary_block_reason(&self, path: &Path) -> Option<String> {
         match physical_boundary_check(&self.cwd, path) {
             Some(_) => None,
@@ -668,9 +923,10 @@ impl PermissionManager {
         }
     }
 
-    /// For a call a plugin escalated. Allow rules, defaults and yolo all turn
-    /// into a question for the user. Only a deny still answers on its own, so
-    /// escalating can make a call harder to run but never easier.
+    /// For a call a plugin escalated. Every allow there is, rules and modes and
+    /// defaults alike, turns into a question for the user. Only a deny still
+    /// answers on its own, so escalating can make a call harder to run but
+    /// never easier.
     fn check_escalated(
         &self,
         tool: &ToolKey,
@@ -679,7 +935,7 @@ impl PermissionManager {
     ) -> PermissionCheck {
         match self.check_inner(tool, scopes, true, plan_path) {
             PermissionCheck::Denied => PermissionCheck::Denied,
-            PermissionCheck::Allowed | PermissionCheck::NeedsPrompt { .. } => {
+            PermissionCheck::Allowed(_) | PermissionCheck::NeedsPrompt { .. } => {
                 PermissionCheck::NeedsPrompt {
                     tool: tool.clone(),
                     scopes: scopes.iter().map(|s| s.to_string()).collect(),
@@ -689,20 +945,39 @@ impl PermissionManager {
         }
     }
 
-    /// `ask` is a plugin's reason to show this call to the user whatever the
-    /// rules say. See [`Self::check_escalated`].
-    #[allow(clippy::too_many_arguments)]
+    /// Reported and charged in one place, so what the caller gets, what
+    /// telemetry says, and what the mode budget spent cannot drift apart.
+    fn allowed_by(&self, tool: &str, source: AllowSource) -> Result<(), PermissionError> {
+        let mut reported = source.as_str();
+        if source == AllowSource::Mode {
+            self.charge_mode();
+            // Yolo is a mode now, and still reports under its own name so the
+            // series that watched for it does not go quiet.
+            if self.is_yolo() {
+                reported = DECISION_SOURCE_YOLO;
+            }
+        }
+        maki_otel::emit::tool_decision(tool, maki_otel::emit::DECISION_ACCEPT, reported);
+        Ok(())
+    }
+
+    /// The gate every tool call passes: resolve the rules, let a decider stand
+    /// in for the user if one is installed, and otherwise ask.
     pub async fn enforce(
         &self,
         tool: &ToolKey,
         scopes: &crate::tools::PermissionScopes,
-        event_tx: &EventSender,
-        user_response_rx: Option<&async_lock::Mutex<flume::Receiver<String>>>,
-        request_id: &str,
-        cancel: &crate::CancelToken,
-        plan_path: Option<&Path>,
-        ask: Option<&str>,
+        gate: Gate<'_>,
     ) -> Result<(), PermissionError> {
+        let Gate {
+            event_tx,
+            user_response_rx,
+            request_id,
+            cancel,
+            plan_path,
+            ask,
+            decider,
+        } = gate;
         let check = |tool: &ToolKey, scopes: &[&str], force_prompt: bool| match ask {
             Some(_) => self.check_escalated(tool, scopes, plan_path),
             None => self.check_inner(tool, scopes, force_prompt, plan_path),
@@ -711,7 +986,7 @@ impl PermissionManager {
         let tool_string = tool.to_string();
         let scope_display = || scopes.scopes.join("; ");
         // Every deny is built here and every approval passes through
-        // `allowed`, so reporting cannot drift from what the caller gets.
+        // `allowed_by`, so reporting cannot drift from what the caller gets.
         let deny = |source: &'static str, guidance: Option<String>| {
             maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_REJECT, source);
             match guidance {
@@ -719,26 +994,29 @@ impl PermissionManager {
                 None => PermissionError::new(&tool_string, &scope_display()),
             }
         };
-        let allowed = |source: &'static str| {
-            maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_ACCEPT, source);
-            Ok(())
-        };
-        let by_rule = || {
-            if self.yolo.load(Ordering::Relaxed) {
-                DECISION_SOURCE_YOLO
-            } else {
-                DECISION_SOURCE_RULE
-            }
-        };
 
         let (pt, ps, force_prompt) = match check(tool, &scope_refs, scopes.force_prompt) {
-            PermissionCheck::Allowed => return allowed(by_rule()),
+            PermissionCheck::Allowed(source) => return self.allowed_by(&tool_string, source),
             PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
             PermissionCheck::NeedsPrompt {
                 tool,
                 scopes,
                 force_prompt,
             } => (tool, scopes, force_prompt),
+        };
+
+        // Asked before the response channel is taken: a decider that shells out
+        // would otherwise hold every other call's prompt behind it, and most
+        // answers here never need the channel at all.
+        let decided = match decider {
+            Some(hook) if ask.is_none() => self.decide(&hook, &tool_string, &ps, cancel).await,
+            _ => Decision::Fallthrough,
+        };
+        let reason = match decided {
+            Decision::Allow => return self.allowed_by(&tool_string, AllowSource::Decide),
+            Decision::Deny(guidance) => return Err(deny(DECISION_SOURCE_DECIDE, guidance)),
+            Decision::Prompt(reason) => reason,
+            Decision::Fallthrough => None,
         };
 
         let Some(rx) = user_response_rx else {
@@ -749,7 +1027,7 @@ impl PermissionManager {
         let guard = rx.lock().await;
         let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
         let (t2, s2) = match check(&pt, &refs, force_prompt) {
-            PermissionCheck::Allowed => return allowed(by_rule()),
+            PermissionCheck::Allowed(source) => return self.allowed_by(&tool_string, source),
             PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
             PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
         };
@@ -758,7 +1036,7 @@ impl PermissionManager {
             id: request_id.to_owned(),
             tool: t2.clone(),
             scopes: s2.clone(),
-            reason: ask.map(str::to_owned),
+            reason: ask.map(str::to_owned).or(reason),
         });
         // Only the answer naming this ask may be applied. Anything else is a
         // leftover from a cancelled or reassigned ask, so it is dropped and the
@@ -793,11 +1071,55 @@ impl PermissionManager {
         self.apply_decision(&t2, &s2, &answer);
         let source = answer.decision_source();
         if answer.is_allow() {
-            allowed(source)
+            maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_ACCEPT, source);
+            Ok(())
         } else {
+            self.note_user_deny();
             Err(deny(source, answer.guidance().map(String::from)))
         }
     }
+
+    /// Hands the call to whoever is layering the decide slot. A decider that
+    /// throws, times out, or answers nothing leaves the prompt where it was.
+    async fn decide(
+        &self,
+        hook: &InstalledPermissionHook,
+        tool: &str,
+        scopes: &[String],
+        cancel: &crate::CancelToken,
+    ) -> Decision {
+        let (auto_calls, max_auto_calls) = self.mode_spend();
+        let mode = self.active_mode_name();
+        let call = PermissionCall {
+            tool,
+            scopes,
+            mode: mode.as_deref(),
+            auto_calls,
+            max_auto_calls,
+            cancel,
+            deadline: Instant::now() + DECIDE_CHAIN_MAX,
+        };
+        hook.run(&call).await
+    }
+}
+
+/// The default written for this tool, falling back to the one written for its
+/// MCP server. `None` when neither names it.
+fn lookup_default(
+    defaults: &HashMap<ToolKey, DefaultEffect>,
+    tool: &ToolKey,
+) -> Option<DefaultEffect> {
+    if let Some(eff) = defaults.get(tool).copied() {
+        return Some(eff);
+    }
+    let ToolKey::McpTool { server, .. } = tool else {
+        return None;
+    };
+    defaults
+        .get(&ToolKey::McpServer {
+            server: server.clone(),
+        })
+        .copied()
 }
 
 /// Whether a rule reaches this tool, and how narrowly it was aimed if it does.
@@ -991,6 +1313,8 @@ fn write_rule_dir(scope: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
     use test_case::test_case;
 
     const PLAN_FILE: &str = "/home/user/.local/state/maki/plans/test.md";
@@ -1015,7 +1339,7 @@ mod tests {
 
     fn outcome(check: PermissionCheck) -> &'static str {
         match check {
-            PermissionCheck::Allowed => ALLOWED,
+            PermissionCheck::Allowed(_) => ALLOWED,
             PermissionCheck::Denied => DENIED,
             PermissionCheck::NeedsPrompt { .. } => PROMPTS,
         }
@@ -1065,6 +1389,45 @@ mod tests {
 
     fn default_mgr() -> PermissionManager {
         mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"))
+    }
+
+    const MODE_NAME: &str = "auto";
+    const OTHER_MODE: &str = "review";
+    const CARGO_CMD: &str = "cargo test";
+    const CARGO_SCOPE: &str = "cargo *";
+
+    fn mode(name: &str, rules: Vec<PermissionRule>) -> Arc<PermissionMode> {
+        Arc::new(PermissionMode {
+            name: name.to_owned(),
+            rules,
+            ..Default::default()
+        })
+    }
+
+    /// A manager with `modes` defined and `on` switched on, which is the state
+    /// every mode test starts from.
+    fn mgr_in_mode(modes: Vec<Arc<PermissionMode>>, on: &str) -> PermissionManager {
+        let mgr = mgr_with(
+            PermissionsConfig {
+                modes,
+                initial_mode: Some(on.to_owned()),
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(mgr.active_mode_name().as_deref(), Some(on));
+        mgr
+    }
+
+    fn bash_check(mgr: &PermissionManager) -> PermissionCheck {
+        mgr.check(&ToolKey::native(BASH_TOOL), CARGO_CMD, None)
+    }
+
+    fn allow_source(check: PermissionCheck) -> Option<AllowSource> {
+        match check {
+            PermissionCheck::Allowed(source) => Some(source),
+            _ => None,
+        }
     }
 
     fn plugin_edit_rule(scope: &str, effect: Effect) -> PermissionRule {
@@ -1242,7 +1605,7 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         let check = mgr.check_multi(&ToolKey::native("bash"), &scopes, false, None);
-        assert_eq!(matches!(check, PermissionCheck::Allowed), expect_allowed);
+        assert_eq!(matches!(check, PermissionCheck::Allowed(_)), expect_allowed);
     }
 
     #[test]
@@ -1282,7 +1645,7 @@ mod tests {
     fn builtin_check(tool: &str, scope: &str) -> bool {
         matches!(
             default_mgr().check(&ToolKey::native(tool), scope, None),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         )
     }
 
@@ -1397,7 +1760,7 @@ mod tests {
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo build", None),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
     }
 
@@ -1452,7 +1815,7 @@ mod tests {
         assert_eq!(project.path().join(PROJECT_DIR).exists(), trusted);
         assert_eq!(project.path().join(PROJECT_PERMISSIONS).is_file(), trusted);
         let check = mgr.check(&ToolKey::native("bash"), "cargo test", None);
-        assert_eq!(matches!(check, PermissionCheck::Allowed), allowed);
+        assert_eq!(matches!(check, PermissionCheck::Allowed(_)), allowed);
         assert_eq!(matches!(check, PermissionCheck::Denied), !allowed);
     }
     #[test]
@@ -1582,7 +1945,7 @@ mod tests {
                 false,
                 None
             ),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
         match mgr.check_multi(
             &ToolKey::native("bash"),
@@ -1664,11 +2027,11 @@ mod tests {
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo build", None),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "git push", None),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
     }
 
@@ -1754,7 +2117,7 @@ mod tests {
                 "{\"url\":\"https://b\"}",
                 None
             ),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
         // A distinct MCP tool is not covered by the fetch rule.
         assert!(!matches!(
@@ -1763,7 +2126,7 @@ mod tests {
                 "{\"cmd\":\"ls\"}",
                 None
             ),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
     }
 
@@ -1830,25 +2193,42 @@ mod tests {
         ));
     }
 
+    /// Yolo is a mode whose one rule allows everything, so the oldest rule of
+    /// all still holds: a deny beats it.
     #[test]
-    fn yolo_mode_allows_but_deny_still_blocks() {
+    fn the_yolo_mode_allows_but_deny_still_blocks() {
         let mgr = mgr_with(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
-        mgr.toggle_yolo();
+        assert!(mgr.toggle_yolo());
         assert!(mgr.is_yolo());
         assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Allowed
+            mgr.check(&ToolKey::native(BASH_TOOL), CARGO_CMD, None),
+            PermissionCheck::Allowed(_)
         ));
         assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
+            mgr.check(&ToolKey::native(BASH_TOOL), "rm -rf /", None),
             PermissionCheck::Denied
         ));
+    }
+
+    /// And it outranks a `default`, which is what a mode's own blanket default
+    /// deliberately does not do. Yolo carries a rule for exactly this reason.
+    #[test]
+    fn the_yolo_mode_outranks_a_per_tool_default() {
+        let mgr = mgr_with(
+            PermissionsConfig {
+                tool_defaults: HashMap::from([(ToolKey::native(BASH_TOOL), DefaultEffect::Deny)]),
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert!(mgr.toggle_yolo());
+        assert_eq!(allow_source(bash_check(&mgr)), Some(AllowSource::Mode));
     }
 
     fn seeded_mgr(yolo: bool) -> PermissionManager {
         mgr_with(
             PermissionsConfig {
-                yolo,
+                initial_mode: yolo.then(|| BUILTIN_MODE_YOLO.to_owned()),
                 ..Default::default()
             },
             PathBuf::from("/tmp"),
@@ -1857,41 +2237,418 @@ mod tests {
 
     /// A fork runs the same session, so it has to answer both questions the
     /// same way or a respawned agent drifts from the tab that owns it.
-    fn yolo_state(mgr: &PermissionManager) -> (bool, Option<bool>) {
+    fn yolo_state(mgr: &PermissionManager) -> (bool, Option<String>) {
         let forked = mgr.fork();
         assert_eq!(
-            (forked.is_yolo(), forked.persisted_yolo()),
-            (mgr.is_yolo(), mgr.persisted_yolo()),
+            (forked.is_yolo(), forked.persisted_mode()),
+            (mgr.is_yolo(), mgr.persisted_mode()),
         );
-        (mgr.is_yolo(), mgr.persisted_yolo())
+        (mgr.is_yolo(), mgr.persisted_mode())
     }
 
-    /// A stored intent replaces the seed outright, and no stored intent falls
+    fn stored_yolo() -> Option<String> {
+        Some(BUILTIN_MODE_YOLO.to_owned())
+    }
+
+    fn stored_off() -> Option<String> {
+        Some(MODE_OFF.to_owned())
+    }
+
+    /// A stored answer replaces the seed outright, and no stored answer falls
     /// back to it: `--yolo` must neither be erased by an untouched session nor
     /// survive one the user explicitly turned off.
-    #[test_case(false, None        => (false, None)        ; "no_flag_and_no_intent_stays_off")]
-    #[test_case(true,  None        => (true,  None)        ; "the_flag_applies_but_is_never_stored")]
-    #[test_case(false, Some(true)  => (true,  Some(true))  ; "stored_on_comes_back_without_the_flag")]
-    #[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
-    #[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
-    #[test_case(false, Some(false) => (false, Some(false)) ; "stored_off_stays_off")]
-    fn a_stored_yolo_intent_replaces_the_seed(
+    #[test_case(false, None             => (false, None)           ; "no_flag_and_no_answer_stays_off")]
+    #[test_case(true,  None             => (true,  None)           ; "the_flag_applies_but_is_never_stored")]
+    #[test_case(false, Some(BUILTIN_MODE_YOLO) => (true, stored_yolo()) ; "stored_on_comes_back_without_the_flag")]
+    #[test_case(true,  Some(BUILTIN_MODE_YOLO) => (true, stored_yolo()) ; "the_flag_does_not_wipe_stored_on")]
+    #[test_case(true,  Some(MODE_OFF)   => (false, stored_off())    ; "stored_off_overrides_the_flag")]
+    #[test_case(false, Some(MODE_OFF)   => (false, stored_off())    ; "stored_off_stays_off")]
+    fn a_stored_answer_replaces_the_seed(
         seed: bool,
-        stored: Option<bool>,
-    ) -> (bool, Option<bool>) {
+        stored: Option<&str>,
+    ) -> (bool, Option<String>) {
         let mgr = seeded_mgr(seed);
-        mgr.set_session_yolo(stored);
+        mgr.set_session_mode(stored).expect("a mode maki ships");
         yolo_state(&mgr)
     }
 
     /// `/yolo` always drives the effective state, so under `--yolo` it can turn
     /// the session off, and either way the session now owns the answer.
-    #[test_case(false => (true,  Some(true))  ; "toggling_on_claims_the_session")]
-    #[test_case(true  => (false, Some(false)) ; "toggling_off_under_the_flag_claims_the_session")]
-    fn toggling_yolo_records_the_intent(seed: bool) -> (bool, Option<bool>) {
+    #[test_case(false => (true,  stored_yolo()) ; "toggling_on_claims_the_session")]
+    #[test_case(true  => (false, stored_off())  ; "toggling_off_under_the_flag_claims_the_session")]
+    fn toggling_yolo_records_the_answer(seed: bool) -> (bool, Option<String>) {
         let mgr = seeded_mgr(seed);
         assert_eq!(mgr.toggle_yolo(), !seed);
         yolo_state(&mgr)
+    }
+
+    /// The whole point of a mode: a call that would have prompted runs, and the
+    /// answer says the mode is why, since that is what the budget is spent on.
+    #[test]
+    fn a_mode_waves_through_what_would_have_prompted() {
+        let mgr = mgr_in_mode(
+            vec![mode(MODE_NAME, vec![allow_rule(CARGO_SCOPE)])],
+            MODE_NAME,
+        );
+        assert_eq!(allow_source(bash_check(&mgr)), Some(AllowSource::Mode));
+        mgr.set_mode(None).unwrap();
+        assert_eq!(
+            outcome(bash_check(&mgr)),
+            PROMPTS,
+            "and asks again once off"
+        );
+    }
+
+    /// A mode is rules, so the rule that no allow outranks a deny holds for it
+    /// too, in both directions.
+    #[test]
+    fn a_deny_still_wins_against_a_mode() {
+        let mgr = mgr_with(
+            PermissionsConfig {
+                rules: vec![deny_rule(CARGO_SCOPE)],
+                modes: vec![mode(MODE_NAME, vec![allow_rule(CARGO_SCOPE)])],
+                initial_mode: Some(MODE_NAME.to_owned()),
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(outcome(bash_check(&mgr)), DENIED);
+    }
+
+    #[test]
+    fn a_mode_deny_blocks_what_the_config_allowed() {
+        let mgr = mgr_with(
+            PermissionsConfig {
+                rules: vec![allow_rule(CARGO_SCOPE)],
+                modes: vec![mode(OTHER_MODE, vec![deny_rule(CARGO_SCOPE)])],
+                initial_mode: Some(OTHER_MODE.to_owned()),
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(outcome(bash_check(&mgr)), DENIED);
+    }
+
+    /// A mode riding along with rules that already allowed the call spends
+    /// nothing, or every call would eat a budget the mode never granted.
+    #[test]
+    fn a_call_the_rules_allowed_is_not_charged_to_the_mode() {
+        let mgr = mgr_with(
+            PermissionsConfig {
+                rules: vec![allow_rule(CARGO_SCOPE)],
+                modes: vec![mode(MODE_NAME, vec![allow_rule(CARGO_SCOPE)])],
+                initial_mode: Some(MODE_NAME.to_owned()),
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(allow_source(bash_check(&mgr)), Some(AllowSource::Rule));
+    }
+
+    /// Specific beats general whoever wrote it, so switching on a mode that
+    /// allows by default cannot quietly undo a per-tool deny in the config.
+    #[test]
+    fn a_config_tool_default_outranks_a_modes_blanket_one() {
+        let mgr = mgr_with(
+            PermissionsConfig {
+                tool_defaults: HashMap::from([(ToolKey::native(BASH_TOOL), DefaultEffect::Deny)]),
+                modes: vec![Arc::new(PermissionMode {
+                    name: MODE_NAME.to_owned(),
+                    default: Some(DefaultEffect::Allow),
+                    ..Default::default()
+                })],
+                initial_mode: Some(MODE_NAME.to_owned()),
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(outcome(bash_check(&mgr)), DENIED);
+        assert_eq!(
+            allow_source(mgr.check(&ToolKey::native(READ_TOOL), "", None)),
+            Some(AllowSource::Mode),
+            "while a tool the config says nothing about follows the mode"
+        );
+    }
+
+    #[test]
+    fn a_modes_tool_default_outranks_the_configs() {
+        let mgr = mgr_with(
+            PermissionsConfig {
+                tool_defaults: HashMap::from([(ToolKey::native(BASH_TOOL), DefaultEffect::Deny)]),
+                modes: vec![Arc::new(PermissionMode {
+                    name: MODE_NAME.to_owned(),
+                    tool_defaults: HashMap::from([(
+                        ToolKey::native(BASH_TOOL),
+                        DefaultEffect::Allow,
+                    )]),
+                    ..Default::default()
+                })],
+                initial_mode: Some(MODE_NAME.to_owned()),
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(allow_source(bash_check(&mgr)), Some(AllowSource::Mode));
+    }
+
+    fn budgeted_mgr(max: u32) -> PermissionManager {
+        mgr_in_mode(
+            vec![Arc::new(PermissionMode {
+                name: MODE_NAME.to_owned(),
+                rules: vec![allow_rule(CARGO_SCOPE)],
+                max_auto_calls: Some(max),
+                ..Default::default()
+            })],
+            MODE_NAME,
+        )
+    }
+
+    /// The budget is spent by calls the mode waved through, and a spent one
+    /// hands the question back to the user rather than widening or narrowing.
+    #[test]
+    fn a_spent_budget_asks_again() {
+        let mgr = budgeted_mgr(2);
+        for spent in 0..2 {
+            assert_eq!(mgr.mode_spend(), (spent, Some(2)));
+            let source = allow_source(bash_check(&mgr)).expect("the mode allows it");
+            assert_eq!(source, AllowSource::Mode);
+            assert!(mgr.allowed_by(BASH_TOOL, source).is_ok());
+        }
+        assert_eq!(outcome(bash_check(&mgr)), PROMPTS);
+        mgr.begin_turn();
+        assert_eq!(mgr.mode_spend(), (0, Some(2)), "a new turn, a new budget");
+        assert_eq!(allow_source(bash_check(&mgr)), Some(AllowSource::Mode));
+    }
+
+    /// A spent budget silences the mode's allows alone: running out of rope is
+    /// no reason to loosen what the mode tightened.
+    #[test]
+    fn a_spent_budget_keeps_denying() {
+        let mgr = mgr_in_mode(
+            vec![Arc::new(PermissionMode {
+                name: MODE_NAME.to_owned(),
+                rules: vec![deny_rule(CARGO_SCOPE)],
+                max_auto_calls: Some(0),
+                ..Default::default()
+            })],
+            MODE_NAME,
+        );
+        assert_eq!(outcome(bash_check(&mgr)), DENIED);
+    }
+
+    /// The same rule one layer down: a spent budget drops the mode's allow-by-
+    /// default and keeps its deny-by-default.
+    #[test_case(DefaultEffect::Allow, PROMPTS ; "an_allow_default_goes_quiet")]
+    #[test_case(DefaultEffect::Deny, DENIED ; "a_deny_default_holds")]
+    fn a_spent_budget_only_silences_the_modes_defaults_that_widen(
+        eff: DefaultEffect,
+        expected: &str,
+    ) {
+        let mgr = mgr_in_mode(
+            vec![Arc::new(PermissionMode {
+                name: MODE_NAME.to_owned(),
+                tool_defaults: HashMap::from([(ToolKey::native(BASH_TOOL), eff)]),
+                max_auto_calls: Some(0),
+                ..Default::default()
+            })],
+            MODE_NAME,
+        );
+        assert_eq!(outcome(bash_check(&mgr)), expected);
+    }
+
+    #[test]
+    fn a_turn_mode_lapses_when_the_turn_ends() {
+        let mgr = mgr_in_mode(
+            vec![Arc::new(PermissionMode {
+                name: MODE_NAME.to_owned(),
+                expires: ModeExpiry::Turn,
+                ..Default::default()
+            })],
+            MODE_NAME,
+        );
+        mgr.begin_turn();
+        assert_eq!(mgr.active_mode_name().as_deref(), Some(MODE_NAME));
+        mgr.end_turn();
+        assert_eq!(mgr.active_mode_name(), None);
+    }
+
+    #[test]
+    fn a_session_mode_survives_the_turn() {
+        let mgr = mgr_in_mode(vec![mode(MODE_NAME, Vec::new())], MODE_NAME);
+        mgr.begin_turn();
+        mgr.end_turn();
+        assert_eq!(mgr.active_mode_name().as_deref(), Some(MODE_NAME));
+    }
+
+    /// The human just contradicted the standing grant, so a mode that asked to
+    /// be dropped over that is dropped. One that did not stays on.
+    #[test_case(true, None ; "revert_on_deny_drops_it")]
+    #[test_case(false, Some(MODE_NAME) ; "otherwise_it_stays")]
+    fn a_denial_from_the_user_can_revert_the_mode(revert: bool, expect: Option<&str>) {
+        let mgr = mgr_in_mode(
+            vec![Arc::new(PermissionMode {
+                name: MODE_NAME.to_owned(),
+                revert_on_deny: revert,
+                ..Default::default()
+            })],
+            MODE_NAME,
+        );
+        mgr.note_user_deny();
+        assert_eq!(mgr.active_mode_name().as_deref(), expect);
+    }
+
+    #[test]
+    fn an_unknown_mode_is_refused_rather_than_read_as_off() {
+        let mgr = mgr_in_mode(vec![mode(MODE_NAME, Vec::new())], MODE_NAME);
+        assert!(mgr.set_mode(Some("nope")).is_err());
+        assert_eq!(
+            mgr.active_mode_name().as_deref(),
+            Some(MODE_NAME),
+            "and leaves the mode it could not change"
+        );
+    }
+
+    /// Cycling walks every mode and passes back through off, so Shift+Tab can
+    /// always get to prompting for everything.
+    #[test]
+    fn cycling_walks_the_modes_and_back_off() {
+        let mgr = mgr_with(
+            PermissionsConfig {
+                modes: vec![mode(MODE_NAME, Vec::new()), mode(OTHER_MODE, Vec::new())],
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        let walked: Vec<Option<String>> = (0..3)
+            .map(|_| mgr.cycle_mode().map(|m| m.name.clone()))
+            .collect();
+        assert_eq!(
+            walked,
+            vec![
+                Some(MODE_NAME.to_owned()),
+                Some(OTHER_MODE.to_owned()),
+                None
+            ]
+        );
+    }
+
+    /// A subagent runs turns of its own, so it inherits the mode and none of
+    /// the parent's spending.
+    #[test]
+    fn a_fork_inherits_the_mode_with_a_fresh_budget() {
+        let mgr = budgeted_mgr(2);
+        mgr.charge_mode();
+        let forked = mgr.fork();
+        assert_eq!(forked.active_mode_name().as_deref(), Some(MODE_NAME));
+        assert_eq!(forked.mode_spend(), (0, Some(2)));
+        assert_eq!(mgr.mode_spend(), (1, Some(2)), "and leaves the parent's");
+    }
+
+    const DECIDE_REASON: &str = "a plugin said no";
+    const ASK_REASON: &str = "a layer wants the human";
+
+    /// Answers with one decision and counts what it was asked about.
+    struct TestDecider {
+        answer: fn() -> Decision,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl TestDecider {
+        /// The decider as the gate takes it, plus the counter the test reads.
+        fn installed(answer: fn() -> Decision) -> (InstalledPermissionHook, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let hook: Box<dyn crate::tools::hook::PermissionHook> = Box::new(Self {
+                answer,
+                calls: Arc::clone(&calls),
+            });
+            (Arc::new(hook), calls)
+        }
+    }
+
+    impl crate::tools::hook::PermissionHook for TestDecider {
+        fn wraps(&self) -> bool {
+            true
+        }
+
+        fn run<'a>(
+            &'a self,
+            _call: &'a PermissionCall<'a>,
+        ) -> crate::tools::registry::BoxFuture<'a, Decision> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let answer = (self.answer)();
+            Box::pin(async move { answer })
+        }
+    }
+
+    /// Runs the gate with `decider` installed and no answer channel, so a call
+    /// that reaches the prompt fails rather than hanging.
+    fn enforce_with(
+        mgr: &PermissionManager,
+        decider: Option<InstalledPermissionHook>,
+        ask: Option<&str>,
+    ) -> Result<(), PermissionError> {
+        let (guard, _events) = crate::event_stream();
+        let event_tx = guard.sender(0);
+        smol::block_on(mgr.enforce(
+            &ToolKey::native(BASH_TOOL),
+            &crate::tools::PermissionScopes::single(CARGO_CMD.to_owned()),
+            Gate {
+                event_tx: &event_tx,
+                user_response_rx: None,
+                request_id: "req",
+                cancel: &crate::CancelToken::none(),
+                plan_path: None,
+                ask,
+                decider,
+            },
+        ))
+    }
+
+    #[test]
+    fn a_decider_can_allow_a_call_the_rules_left_to_the_user() {
+        let mgr = mgr_in_mode(vec![mode(MODE_NAME, Vec::new())], MODE_NAME);
+        let (decider, _) = TestDecider::installed(|| Decision::Allow);
+        assert!(enforce_with(&mgr, Some(decider), None).is_ok());
+        assert_eq!(
+            mgr.mode_spend(),
+            (0, None),
+            "a decider's grant is its own, not the mode's to pay for"
+        );
+    }
+
+    #[test]
+    fn a_decider_can_deny_with_its_own_guidance() {
+        let mgr = default_mgr();
+        let (decider, _) =
+            TestDecider::installed(|| Decision::Deny(Some(DECIDE_REASON.to_owned())));
+        let err = enforce_with(&mgr, Some(decider), None).expect_err("denied");
+        assert!(err.to_string().contains(DECIDE_REASON));
+    }
+
+    /// An escalation is someone asking for the human, which no decider may
+    /// answer on their behalf.
+    #[test]
+    fn an_escalated_call_is_never_handed_to_the_decider() {
+        let mgr = default_mgr();
+        let (decider, calls) = TestDecider::installed(|| Decision::Allow);
+        assert!(
+            enforce_with(&mgr, Some(decider), Some(ASK_REASON)).is_err(),
+            "with no channel to ask on, the call cannot be approved"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// A rule that already settled the call never reaches the decider: the slot
+    /// stands in for the prompt, and there was no prompt.
+    #[test]
+    fn a_decider_is_not_asked_about_a_call_the_rules_allowed() {
+        let mgr = mgr_with(
+            make_config(vec![allow_rule(CARGO_SCOPE)]),
+            PathBuf::from("/tmp"),
+        );
+        let (decider, calls) = TestDecider::installed(|| Decision::Deny(None));
+        assert!(enforce_with(&mgr, Some(decider), None).is_ok());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1939,7 +2696,7 @@ mod tests {
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
@@ -1958,7 +2715,7 @@ mod tests {
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
     }
 
@@ -1992,7 +2749,7 @@ mod tests {
                 "{}",
                 None
             ),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
         assert!(matches!(
             mgr.check(
@@ -2003,7 +2760,7 @@ mod tests {
                 "{}",
                 None
             ),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
     }
 
@@ -2028,7 +2785,7 @@ mod tests {
                 "{}",
                 None
             ),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
     }
 
@@ -2045,7 +2802,7 @@ mod tests {
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
         assert!(matches!(
             mgr.check(&ToolKey::native("write"), "/etc/passwd", None),
@@ -2062,7 +2819,7 @@ mod tests {
         assert_eq!(
             matches!(
                 mgr.check(&ToolKey::native(tool), PLAN_FILE, Some(plan_path)),
-                PermissionCheck::Allowed
+                PermissionCheck::Allowed(_)
             ),
             expect_allowed,
         );
@@ -2083,7 +2840,7 @@ mod tests {
     ) -> &'static str {
         let mgr = mgr_with(
             PermissionsConfig {
-                yolo: true,
+                initial_mode: Some(BUILTIN_MODE_YOLO.to_owned()),
                 default,
                 ..Default::default()
             },
@@ -2135,8 +2892,9 @@ mod tests {
     }
 
     /// A rule that was not written for this exact tool is a standing approval
-    /// the user never gave it, so plan mode holds it back the way it holds back
-    /// yolo. Denies are not approvals and keep winning.
+    /// the user never gave it, so plan mode holds it back. That is what holds
+    /// back the yolo mode too, whose one rule names no tool. Denies are not
+    /// approvals and keep winning.
     #[test_case(ToolKey::Wildcard,  Effect::Allow, true  => PROMPTS ; "wildcard_allow_prompts_in_plan_mode")]
     #[test_case(mcp_server_key(),   Effect::Allow, true  => PROMPTS ; "server_allow_prompts_in_plan_mode")]
     #[test_case(mcp_tool_key(),     Effect::Allow, true  => ALLOWED ; "exact_tool_allow_decides_in_plan_mode")]
@@ -2178,7 +2936,7 @@ mod tests {
         for m in [&mgr, &fork] {
             assert!(matches!(
                 m.check(&ToolKey::native("edit"), "/x/f", None),
-                PermissionCheck::Allowed
+                PermissionCheck::Allowed(_)
             ));
         }
     }
@@ -2212,7 +2970,7 @@ mod tests {
                 false,
                 Some(plan_path),
             ),
-            PermissionCheck::Allowed
+            PermissionCheck::Allowed(_)
         ));
 
         // One scope is non-plan → needs prompt

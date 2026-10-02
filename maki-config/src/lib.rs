@@ -290,6 +290,14 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         description: "Start every session with YOLO mode (skip permission prompts, deny rules still apply)",
     },
     ConfigField {
+        name: "always_permission_mode",
+        ty: "string",
+        default: ConfigValue::Str("-"),
+        min: None,
+        env: None,
+        description: "Permission mode every session starts in: a `[modes.*]` name from permissions.toml, or a built-in (`accept_edits`, `yolo`)",
+    },
+    ConfigField {
         name: "always_fast",
         ty: "bool",
         default: ConfigValue::Bool(false),
@@ -364,6 +372,11 @@ pub enum ConfigError {
     },
     #[error("invalid config: always_thinking: {0}")]
     Thinking(#[from] ThinkingParseError),
+    #[error(
+        "no permission mode named \"{mode}\". Write a [modes.{mode}] section in \
+         permissions.toml{available}"
+    )]
+    UnknownMode { mode: String, available: String },
     #[error(
         "invalid config: plugins.{tool} was removed; {tool} is provided by the edit plugin, \
          set plugins.edit = {{ {tool} = true|false }} instead"
@@ -474,6 +487,7 @@ impl SessionDefaults {
 #[serde(default, deny_unknown_fields)]
 pub struct RawConfig {
     pub always_yolo: Option<bool>,
+    pub always_permission_mode: Option<String>,
     pub always_fast: Option<bool>,
     pub always_workflow: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
@@ -497,6 +511,7 @@ impl RawConfig {
             self,
             overlay,
             always_yolo,
+            always_permission_mode,
             always_fast,
             always_workflow,
             always_thinking
@@ -526,6 +541,7 @@ impl RawConfig {
         self.validate_plugin_tables(packages)?;
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
+            always_permission_mode: self.always_permission_mode,
             session_defaults: SessionDefaults {
                 fast: self.always_fast.unwrap_or(false),
                 workflow: self.always_workflow.unwrap_or(false),
@@ -869,6 +885,19 @@ struct PermissionsFileConfig {
     tools: HashMap<String, ToolPermissions>,
     mcp_rules: Vec<PermissionRule>,
     mcp_defaults: HashMap<ToolKey, DefaultEffect>,
+    modes: BTreeMap<String, ModeFileConfig>,
+}
+
+/// A `[modes.<name>]` table: a permissions body plus the budget that makes it
+/// a mode rather than another layer of rules.
+#[derive(Default)]
+struct ModeFileConfig {
+    body: PermissionsFileConfig,
+    description: Option<String>,
+    max_auto_calls: Option<u32>,
+    revert_on_deny: bool,
+    expires: ModeExpiry,
+    cycle: Option<bool>,
 }
 
 impl PermissionsFileConfig {
@@ -883,69 +912,182 @@ impl PermissionsFileConfig {
             perms.allow = None;
             perms.default = None;
         }
+        // A mode is a standing grant, so an untrusted repository defining one
+        // is exactly what the gate is for. Its denies are kept for the same
+        // reason the file's are.
+        for mode in self.modes.values_mut() {
+            mode.body.restrict_to_deny_scopes();
+        }
     }
 }
 
+/// Keys a `[modes.<name>]` table carries itself, which its body must not read
+/// as tool sections.
+const MODE_KEYS: [&str; 5] = [
+    "description",
+    "max_auto_calls",
+    "revert_on_deny",
+    "expires",
+    "cycle",
+];
+const MODES_KEY: &str = "modes";
+
 impl<'de> Deserialize<'de> for PermissionsFileConfig {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let table = toml::Table::deserialize(deserializer)?;
-        let default = table
-            .get("default")
-            .and_then(|v| DefaultEffect::deserialize(v.clone()).ok())
-            .or_else(|| {
-                table
-                    .get("allow_all")?
-                    .as_bool()?
-                    .then_some(DefaultEffect::Allow)
-            });
+        Ok(parse_permissions_table(
+            &toml::Table::deserialize(deserializer)?,
+            true,
+        ))
+    }
+}
 
-        let mut tools = HashMap::new();
-        let mut mcp_rules = Vec::new();
-        let mut mcp_defaults = HashMap::new();
+/// `modes_allowed` is false inside a mode body: a mode is a bundle of rules,
+/// not a place to nest more bundles.
+fn parse_permissions_table(table: &toml::Table, modes_allowed: bool) -> PermissionsFileConfig {
+    let default = table
+        .get("default")
+        .and_then(|v| DefaultEffect::deserialize(v.clone()).ok())
+        .or_else(|| {
+            table
+                .get("allow_all")?
+                .as_bool()?
+                .then_some(DefaultEffect::Allow)
+        });
 
-        for (k, v) in table.iter() {
-            if k.is_empty() || k == "allow_all" || k == "default" {
-                continue;
-            }
-            if k == "mcp" {
-                // TOML [mcp.server] creates nested table: mcp → {server → {...}}
-                if let Some(mcp_table) = v.as_table() {
-                    for (server_name, server_value) in mcp_table {
-                        if let Some(server_table) = server_value.as_table() {
-                            parse_mcp_server_table(
-                                server_name,
-                                server_table,
-                                &mut mcp_rules,
-                                &mut mcp_defaults,
-                            );
-                        } else {
-                            tracing::warn!(
-                                server = server_name.as_str(),
-                                "[mcp.{server_name}] is not a table — skipping"
-                            );
-                        }
+    let mut tools = HashMap::new();
+    let mut mcp_rules = Vec::new();
+    let mut mcp_defaults = HashMap::new();
+    let mut modes = BTreeMap::new();
+
+    for (k, v) in table.iter() {
+        if k.is_empty() || k == "allow_all" || k == "default" {
+            continue;
+        }
+        if k == "mcp" {
+            // TOML [mcp.server] creates nested table: mcp → {server → {...}}
+            if let Some(mcp_table) = v.as_table() {
+                for (server_name, server_value) in mcp_table {
+                    if let Some(server_table) = server_value.as_table() {
+                        parse_mcp_server_table(
+                            server_name,
+                            server_table,
+                            &mut mcp_rules,
+                            &mut mcp_defaults,
+                        );
+                    } else {
+                        tracing::warn!(
+                            server = server_name.as_str(),
+                            "[mcp.{server_name}] is not a table — skipping"
+                        );
                     }
-                } else {
-                    tracing::warn!("[mcp] is not a table (got {}) — skipping", v.type_str());
                 }
-            } else if let Ok(tp) = v.clone().try_into::<ToolPermissions>() {
-                if k.contains('.') {
+            } else {
+                tracing::warn!("[mcp] is not a table (got {}) — skipping", v.type_str());
+            }
+        } else if k == MODES_KEY {
+            match (v.as_table(), modes_allowed) {
+                (Some(table), true) => parse_modes_table(table, &mut modes),
+                (Some(_), false) => tracing::warn!(
+                    "[modes.*.{MODES_KEY}] is not a thing — a mode cannot hold modes. Skipping."
+                ),
+                (None, _) => {
                     tracing::warn!(
-                        key = k.as_str(),
-                        "tool section [{k}] contains a dot — did you mean [mcp.{k}]? Skipping."
-                    );
-                } else {
-                    tools.insert(k.clone(), tp);
+                        "[{MODES_KEY}] is not a table (got {}) — skipping",
+                        v.type_str()
+                    )
                 }
+            }
+        } else if MODE_KEYS.contains(&k.as_str()) && !modes_allowed {
+            // A mode's own keys, already read by `parse_mode_table`.
+        } else if let Ok(tp) = v.clone().try_into::<ToolPermissions>() {
+            if k.contains('.') {
+                tracing::warn!(
+                    key = k.as_str(),
+                    "tool section [{k}] contains a dot — did you mean [mcp.{k}]? Skipping."
+                );
+            } else {
+                tools.insert(k.clone(), tp);
             }
         }
+    }
 
-        Ok(Self {
-            default,
-            tools,
-            mcp_rules,
-            mcp_defaults,
-        })
+    PermissionsFileConfig {
+        default,
+        tools,
+        mcp_rules,
+        mcp_defaults,
+        modes,
+    }
+}
+
+fn parse_modes_table(table: &toml::Table, modes: &mut BTreeMap<String, ModeFileConfig>) {
+    for (name, value) in table {
+        let Some(body) = value.as_table() else {
+            tracing::warn!(
+                mode = name.as_str(),
+                "[{MODES_KEY}.{name}] is not a table — skipping"
+            );
+            continue;
+        };
+        modes.insert(name.clone(), parse_mode_table(name, body));
+    }
+}
+
+/// A budget key maki cannot read is a silent widening if it is ignored
+/// quietly, so every one of them says what it expected.
+fn mode_key<T>(
+    name: &str,
+    table: &toml::Table,
+    key: &str,
+    read: impl Fn(&toml::Value) -> Option<T>,
+    expected: &str,
+) -> Option<T> {
+    let value = table.get(key)?;
+    let read = read(value);
+    if read.is_none() {
+        tracing::warn!(
+            mode = name,
+            value = ?value,
+            "invalid [{MODES_KEY}.{name}].{key} — expected {expected}, ignoring it"
+        );
+    }
+    read
+}
+
+fn parse_mode_table(name: &str, table: &toml::Table) -> ModeFileConfig {
+    ModeFileConfig {
+        body: parse_permissions_table(table, false),
+        description: mode_key(
+            name,
+            table,
+            "description",
+            |v| v.as_str().map(str::to_owned),
+            "a string",
+        ),
+        max_auto_calls: mode_key(
+            name,
+            table,
+            "max_auto_calls",
+            |v| v.as_integer().and_then(|n| u32::try_from(n).ok()),
+            "a call count",
+        ),
+        revert_on_deny: mode_key(
+            name,
+            table,
+            "revert_on_deny",
+            toml::Value::as_bool,
+            "true or false",
+        )
+        .unwrap_or_default(),
+        expires: mode_key(
+            name,
+            table,
+            "expires",
+            |v| v.clone().try_into().ok(),
+            "\"session\" or \"turn\"",
+        )
+        .unwrap_or_default(),
+        cycle: mode_key(name, table, "cycle", toml::Value::as_bool, "true or false"),
     }
 }
 
@@ -1134,6 +1276,103 @@ pub enum ToolKeyParseError {
     },
 }
 
+/// When an active mode stops applying on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModeExpiry {
+    /// Stays on until it is switched off, like a session rule.
+    #[default]
+    Session,
+    /// Lapses when the turn it was switched on in ends.
+    Turn,
+}
+
+/// A named bundle of permission rules the user switches on for a while: the
+/// auto-accept modes, spelled out instead of hardcoded.
+///
+/// It is the same shape as the file it is written in, because a mode answers
+/// the same questions a `permissions.toml` answers. What it adds is a budget:
+/// a standing grant the user turned on by hand is worth bounding, which a rule
+/// written into the file is not.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionMode {
+    pub name: String,
+    pub description: Option<String>,
+    /// `None` leaves the file's own default in place.
+    pub default: Option<DefaultEffect>,
+    pub tool_defaults: HashMap<ToolKey, DefaultEffect>,
+    pub rules: Vec<PermissionRule>,
+    /// How many calls this mode may wave through in one turn. `None` is
+    /// unbounded.
+    pub max_auto_calls: Option<u32>,
+    /// Whether a denial from the user switches the mode back off.
+    pub revert_on_deny: bool,
+    pub expires: ModeExpiry,
+    /// `Some(false)` keeps the mode out of the cycle key, so it has to be named
+    /// to be switched on. Absent means it cycles like the rest.
+    pub cycle: Option<bool>,
+}
+
+impl PermissionMode {
+    pub fn in_cycle(&self) -> bool {
+        self.cycle != Some(false)
+    }
+
+    /// Whether the mode waves through everything a deny rule does not catch.
+    /// The status bar says so louder than it does for a mode that named the
+    /// tools it covers.
+    pub fn grants_everything(&self) -> bool {
+        self.default == Some(DefaultEffect::Allow)
+            || self.rules.iter().any(|rule| {
+                matches!(rule.tool, ToolKey::Wildcard)
+                    && rule.scope.is_none()
+                    && rule.effect == Effect::Allow
+            })
+    }
+}
+
+/// What `/permission off` and a session that was switched off both say. A mode
+/// cannot take the name, or switching off would be unreachable.
+pub const MODE_OFF: &str = "off";
+
+/// The modes maki ships. Their names resolve in a config that never mentions
+/// modes, because the SDK and ACP wire names point at them.
+pub const BUILTIN_MODE_ACCEPT_EDITS: &str = "accept_edits";
+pub const BUILTIN_MODE_YOLO: &str = "yolo";
+
+fn builtin_modes() -> Vec<PermissionMode> {
+    vec![
+        PermissionMode {
+            name: BUILTIN_MODE_ACCEPT_EDITS.to_owned(),
+            description: Some(
+                "Write files anywhere without asking; everything else still asks".into(),
+            ),
+            tool_defaults: FILE_WRITE_TOOLS
+                .iter()
+                .map(|t| (ToolKey::native(t), DefaultEffect::Allow))
+                .collect(),
+            ..Default::default()
+        },
+        // A blanket allow rule rather than `default = "allow"`, which is what
+        // keeps yolo as strong as it has always been: a rule outranks every
+        // `default` in the file, so `[bash] default = "deny"` does not hold it
+        // back, while a deny rule still does.
+        PermissionMode {
+            name: BUILTIN_MODE_YOLO.to_owned(),
+            description: Some("Skip every permission prompt; deny rules still apply".into()),
+            rules: vec![PermissionRule {
+                tool: ToolKey::Wildcard,
+                scope: None,
+                effect: Effect::Allow,
+            }],
+            // One keypress must not hand over everything, so this one is named
+            // out loud: `/permission yolo`, `/yolo`, or `--yolo`.
+            cycle: Some(false),
+            ..Default::default()
+        },
+    ]
+}
+
 #[derive(Debug, Clone)]
 pub struct PermissionRule {
     pub tool: ToolKey,
@@ -1141,17 +1380,54 @@ pub struct PermissionRule {
     pub effect: Effect,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PermissionsConfig {
     pub default: DefaultEffect,
     pub tool_defaults: HashMap<ToolKey, DefaultEffect>,
     pub rules: Vec<PermissionRule>,
-    pub yolo: bool,
+    /// Sorted by name, which is the order `/permission` lists and cycles them in.
+    pub modes: Vec<Arc<PermissionMode>>,
+    /// The mode to switch on at startup, from `--permission-mode` or
+    /// `always_permission_mode`. Checked by [`Config::validate`], so a manager
+    /// never has to answer for a name nobody defined.
+    pub initial_mode: Option<String>,
+}
+
+/// The shipped modes are part of maki rather than of anyone's file, so even a
+/// config nobody wrote has them. It is what lets `/yolo` work in a driver that
+/// never read a `permissions.toml`.
+impl Default for PermissionsConfig {
+    fn default() -> Self {
+        Self {
+            default: DefaultEffect::default(),
+            tool_defaults: HashMap::new(),
+            rules: Vec::new(),
+            modes: builtin_modes().into_iter().map(Arc::new).collect(),
+            initial_mode: None,
+        }
+    }
+}
+
+impl PermissionsConfig {
+    pub fn mode(&self, name: &str) -> Option<&Arc<PermissionMode>> {
+        self.modes.iter().find(|mode| mode.name == name)
+    }
+
+    fn mode_names(&self) -> String {
+        self.modes
+            .iter()
+            .map(|mode| mode.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 #[derive(Clone)]
 pub struct Config {
     pub always_yolo: bool,
+    /// What `always_permission_mode` asked for, still unresolved: the
+    /// permissions it names are loaded after the config is.
+    pub always_permission_mode: Option<String>,
     pub session_defaults: SessionDefaults,
     pub ui: UiConfig,
     pub agent: AgentConfig,
@@ -2016,6 +2292,19 @@ impl Config {
         self.agent.validate()?;
         self.provider.validate()?;
         self.storage.validate()?;
+        if let Some(mode) = &self.permissions.initial_mode
+            && self.permissions.mode(mode).is_none()
+        {
+            let names = self.permissions.mode_names();
+            return Err(ConfigError::UnknownMode {
+                mode: mode.clone(),
+                available: if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (defined: {names})")
+                },
+            });
+        }
         Ok(())
     }
 }
@@ -2323,7 +2612,80 @@ fn build_permissions(
         default,
         tool_defaults,
         rules,
-        yolo: false,
+        modes: build_modes(global.modes, project.modes),
+        initial_mode: None,
+    }
+}
+
+/// Built-ins first, then whatever the files named, each name resolving once:
+/// a project definition replaces a global one, and either replaces a built-in.
+/// Only the name is inherited that way, never a field, so a mode reads exactly
+/// as it is written.
+fn build_modes(
+    global: BTreeMap<String, ModeFileConfig>,
+    project: BTreeMap<String, ModeFileConfig>,
+) -> Vec<Arc<PermissionMode>> {
+    let mut modes: BTreeMap<String, PermissionMode> = builtin_modes()
+        .into_iter()
+        .map(|m| (m.name.clone(), m))
+        .collect();
+    let from_global = global.into_iter().map(|entry| (entry, false));
+    let from_project = project.into_iter().map(|entry| (entry, true));
+    for ((name, file), is_project) in from_global.chain(from_project) {
+        if name == MODE_OFF {
+            warn!(
+                "[{MODES_KEY}.{MODE_OFF}] is ignored: \"{MODE_OFF}\" is how a mode is switched off"
+            );
+            continue;
+        }
+        modes.insert(name.clone(), build_mode(name, file, is_project));
+    }
+    modes.into_values().map(Arc::new).collect()
+}
+
+/// `is_project` carries the one asymmetry between the two files into a mode: a
+/// repository may narrow what runs inside it, never widen it, so its modes get
+/// their allow-by-default dropped exactly as the file's own is.
+fn build_mode(name: String, file: ModeFileConfig, is_project: bool) -> PermissionMode {
+    let ModeFileConfig {
+        body,
+        description,
+        max_auto_calls,
+        revert_on_deny,
+        expires,
+        cycle,
+    } = file;
+    let widens = |eff: &DefaultEffect| is_project && *eff == DefaultEffect::Allow;
+
+    let mut tool_defaults: HashMap<ToolKey, DefaultEffect> = body
+        .tools
+        .iter()
+        .filter_map(|(tool, perms)| Some((ToolKey::native(tool), perms.default?)))
+        .filter(|(key, eff)| !matches!(key, ToolKey::Wildcard) && !widens(eff))
+        .collect();
+    tool_defaults.extend(
+        body.mcp_defaults
+            .into_iter()
+            .filter(|(_, eff)| !widens(eff)),
+    );
+
+    let mut rules = body.mcp_rules;
+    rules.sort_by_key(|rule| rule.effect == Effect::Allow);
+    let mut tool_rules = Vec::new();
+    push_rules(&mut tool_rules, &body.tools, Effect::Deny);
+    push_rules(&mut tool_rules, &body.tools, Effect::Allow);
+    rules.splice(..0, tool_rules);
+
+    PermissionMode {
+        name,
+        description,
+        default: body.default.filter(|eff| !widens(eff)),
+        tool_defaults,
+        rules,
+        max_auto_calls,
+        revert_on_deny,
+        expires,
+        cycle,
     }
 }
 
@@ -3213,6 +3575,7 @@ mod tests {
     fn validate_rejects_invalid_sections(section: &str, field: &str, value: u64) {
         let mut config = Config {
             always_yolo: false,
+            always_permission_mode: None,
             session_defaults: SessionDefaults::default(),
             ui: UiConfig::default(),
             agent: AgentConfig::default(),
@@ -3263,6 +3626,168 @@ mod tests {
         assert_eq!(perms.rules[1].effect, Effect::Allow);
         assert_eq!(perms.rules[1].tool, ToolKey::native("bash"));
         assert_eq!(perms.rules[1].scope.as_deref(), Some("cargo *"));
+    }
+
+    const MODE_SOURCE: &str = "[modes.auto]\n\
+         description = \"auto\"\n\
+         max_auto_calls = 25\n\
+         revert_on_deny = true\n\
+         expires = \"turn\"\n\
+         default = \"deny\"\n\
+         [modes.auto.bash]\n\
+         allow = [\"cargo *\"]\n\
+         deny = [\"cargo publish *\"]\n\
+         [modes.auto.edit]\n\
+         default = \"allow\"\n";
+    const MODE_NAME: &str = "auto";
+
+    fn loaded_mode(dir: &Path, global: &PathBuf, name: &str) -> Arc<PermissionMode> {
+        loaded_mode_with(&ProjectConfig::for_project(dir), global, name)
+    }
+
+    fn loaded_mode_with(
+        project: &ProjectConfig,
+        global: &PathBuf,
+        name: &str,
+    ) -> Arc<PermissionMode> {
+        load_permissions_inner(std::slice::from_ref(global), project)
+            .mode(name)
+            .cloned()
+            .unwrap_or_else(|| panic!("a mode named {name}"))
+    }
+
+    /// A typo in `--permission-mode` must not read as "no mode": the flag is
+    /// how a user asks for a standing grant, so a name nobody defined is an
+    /// error with the defined names in it.
+    #[test]
+    fn an_initial_mode_nobody_defines_is_refused() {
+        let mut config = RawConfig::default()
+            .into_config(&[])
+            .expect("a default config");
+        config.permissions.modes = builtin_modes().into_iter().map(Arc::new).collect();
+        config.permissions.initial_mode = Some("nope".to_owned());
+
+        let err = config.validate().expect_err("refused");
+        let message = err.to_string();
+        assert!(message.contains("nope"), "{message}");
+        assert!(message.contains(BUILTIN_MODE_ACCEPT_EDITS), "{message}");
+
+        config.permissions.initial_mode = Some(BUILTIN_MODE_ACCEPT_EDITS.to_owned());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn a_mode_reads_as_a_permissions_file_with_a_budget() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), MODE_SOURCE);
+
+        let mode = loaded_mode(dir.path(), &global, MODE_NAME);
+        assert_eq!(mode.description.as_deref(), Some(MODE_NAME));
+        assert_eq!(mode.max_auto_calls, Some(25));
+        assert!(mode.revert_on_deny);
+        assert_eq!(mode.expires, ModeExpiry::Turn);
+        assert_eq!(mode.default, Some(DefaultEffect::Deny));
+        assert_eq!(
+            mode.tool_defaults.get(&ToolKey::native("edit")),
+            Some(&DefaultEffect::Allow)
+        );
+        // Denies first, the same order the file itself is built in.
+        assert_eq!(mode.rules[0].effect, Effect::Deny);
+        assert_eq!(mode.rules[0].scope.as_deref(), Some("cargo publish *"));
+        assert_eq!(mode.rules[1].effect, Effect::Allow);
+        assert_eq!(mode.rules[1].scope.as_deref(), Some("cargo *"));
+    }
+
+    /// The one mode maki ships has to resolve in a config that never mentions
+    /// modes, because `acceptEdits` on the SDK wire names it.
+    #[test]
+    fn the_builtin_mode_is_there_without_a_permissions_file() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        let mode = loaded_mode(dir.path(), &global, BUILTIN_MODE_ACCEPT_EDITS);
+        for tool in FILE_WRITE_TOOLS {
+            assert_eq!(
+                mode.tool_defaults.get(&ToolKey::native(tool)),
+                Some(&DefaultEffect::Allow),
+                "{tool} writes without asking in {BUILTIN_MODE_ACCEPT_EDITS}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_mode_replaces_a_builtin_of_the_same_name() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            &format!("[modes.{BUILTIN_MODE_ACCEPT_EDITS}.write]\ndefault = \"deny\"\n"),
+        );
+        let mode = loaded_mode(dir.path(), &global, BUILTIN_MODE_ACCEPT_EDITS);
+        assert_eq!(
+            mode.tool_defaults.get(&ToolKey::native("write")),
+            Some(&DefaultEffect::Deny),
+            "the name resolves once, to what the user wrote"
+        );
+        assert!(
+            !mode.tool_defaults.contains_key(&ToolKey::native("edit")),
+            "and inherits no field from the built-in it replaced"
+        );
+    }
+
+    /// A mode is a standing grant, so the rule that keeps a repository from
+    /// granting itself one has to hold inside a mode too.
+    #[test]
+    fn a_project_mode_cannot_allow_by_default() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_project_permissions(
+            dir.path(),
+            "[modes.auto]\ndefault = \"allow\"\n\
+             [modes.auto.write]\ndefault = \"allow\"\n\
+             [modes.auto.bash]\nallow = [\"ls *\"]\n",
+        );
+        let mode = loaded_mode(dir.path(), &global, MODE_NAME);
+        assert_eq!(mode.default, None, "the fallback effect is dropped");
+        assert!(
+            !mode.tool_defaults.contains_key(&ToolKey::native("write")),
+            "and so is a per-tool one"
+        );
+        assert_eq!(
+            mode.rules.len(),
+            1,
+            "while the allow list a trusted folder wrote stays"
+        );
+    }
+
+    #[test]
+    fn an_untrusted_project_mode_keeps_only_its_denies() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_project_permissions(
+            dir.path(),
+            "[modes.auto.bash]\nallow = [\"ls *\"]\ndeny = [\"curl *\"]\n",
+        );
+        let untrusted = ProjectConfig::discover(dir.path()).with_trust(false);
+        let mode = loaded_mode_with(&untrusted, &global, MODE_NAME);
+        assert_eq!(mode.rules.len(), 1);
+        assert_eq!(mode.rules[0].effect, Effect::Deny);
+    }
+
+    #[test]
+    fn a_mode_cannot_hold_modes() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "[modes.auto.modes.nested.bash]\nallow = [\"ls\"]\n",
+        );
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
+        assert!(perms.mode("nested").is_none());
+        assert!(perms.mode(MODE_NAME).is_some_and(|m| m.rules.is_empty()));
     }
 
     #[test]

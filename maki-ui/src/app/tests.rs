@@ -20,6 +20,7 @@ use maki_agent::{
     McpSnapshot, McpSnapshotReader, SharedBuf, SubagentInbox, ToolDoneEvent, ToolOutput,
     ToolStartEvent, TurnCompleteEvent,
 };
+use maki_config::{BUILTIN_MODE_YOLO, PermissionMode};
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
@@ -128,7 +129,7 @@ fn build_app_with_lua(
 fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
     Arc::new(PermissionManager::new(
         PermissionsConfig {
-            yolo,
+            initial_mode: yolo.then(|| BUILTIN_MODE_YOLO.to_owned()),
             ..Default::default()
         },
         PathBuf::from(PERMISSIONS_CWD),
@@ -901,7 +902,9 @@ fn blank_session_carries_the_settings_that_outlive_a_turn() {
     app.input_box.set_input("half a thought".into());
     app.queue_and_notify(queued_msg("q"));
     app.permissions.load_session_rules(vec![session_rule()]);
-    app.permissions.set_session_yolo(Some(true));
+    app.permissions
+        .set_mode(Some(BUILTIN_MODE_YOLO))
+        .expect("a mode maki ships");
     app.checkpoint();
 
     let session = app.blank_session().session;
@@ -915,13 +918,164 @@ fn blank_session_carries_the_settings_that_outlive_a_turn() {
             }),
             fast: true,
             workflow: true,
-            yolo: Some(true),
+            permission_mode: Some(BUILTIN_MODE_YOLO.to_owned()),
             ..Default::default()
         }
     );
     assert!(session.messages().is_empty());
     assert_eq!(session.model, app.state.model.spec());
     assert_eq!(session.cwd, app.state.session.cwd);
+}
+
+fn stored_yolo() -> Option<String> {
+    Some(BUILTIN_MODE_YOLO.to_owned())
+}
+
+fn stored_off() -> Option<String> {
+    Some(MODE_OFF.to_owned())
+}
+
+const MODE_AUTO: &str = "auto";
+const MODE_REVIEW: &str = "review";
+
+fn permissions_with_modes(active: Option<&str>) -> Arc<PermissionManager> {
+    let modes = [MODE_AUTO, MODE_REVIEW]
+        .map(|name| {
+            Arc::new(PermissionMode {
+                name: name.to_owned(),
+                ..Default::default()
+            })
+        })
+        .to_vec();
+    Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            modes,
+            initial_mode: active.map(str::to_owned),
+            ..Default::default()
+        },
+        PathBuf::from(PERMISSIONS_CWD),
+        ProjectConfig::for_project(Path::new(PERMISSIONS_CWD)),
+        Arc::default(),
+    ))
+}
+
+fn app_with_modes(active: Option<&str>) -> App {
+    let dir = tmp_state();
+    let writer = Arc::new(test_writer(dir.clone()));
+    let tab = OpenSession::fresh(TEST_MODEL_SPEC, TEST_CWD, &dir);
+    build_app_with_session(
+        dir,
+        writer,
+        LuaCommandReader::empty(),
+        tab,
+        permissions_with_modes(active),
+    )
+}
+
+#[test]
+fn the_permission_command_switches_lists_and_turns_modes_off() {
+    let mut app = app_with_modes(None);
+
+    app.execute_command(cmd(&format!("/permission {MODE_AUTO}")), 0);
+    assert_eq!(
+        app.permissions.active_mode_name().as_deref(),
+        Some(MODE_AUTO)
+    );
+
+    app.execute_command(cmd("/permission"), 0);
+    let listed = app.status_bar.flash_text().unwrap_or_default().to_string();
+    assert!(
+        listed.contains(&format!("*{MODE_AUTO}")) && listed.contains(MODE_REVIEW),
+        "the list marks the active mode: {listed}"
+    );
+
+    app.execute_command(cmd("/permission off"), 0);
+    assert_eq!(app.permissions.active_mode_name(), None);
+}
+
+/// A name nobody defined leaves the mode alone and says so, rather than
+/// reading as "off".
+#[test]
+fn an_unknown_permission_mode_is_reported() {
+    let mut app = app_with_modes(Some(MODE_AUTO));
+    app.execute_command(cmd("/permission nope"), 0);
+    assert_eq!(
+        app.permissions.active_mode_name().as_deref(),
+        Some(MODE_AUTO)
+    );
+    assert!(
+        app.status_bar
+            .flash_text()
+            .is_some_and(|f| f.contains("nope")),
+    );
+}
+
+#[test]
+fn shift_tab_cycles_the_permission_modes_and_back_off() {
+    let mut app = app_with_modes(None);
+    let mut walk = || {
+        app.update(Msg::Key(key(KeyCode::BackTab)));
+        app.permissions.active_mode_name()
+    };
+    assert_eq!(walk().as_deref(), Some(MODE_AUTO));
+    assert_eq!(walk().as_deref(), Some(MODE_REVIEW));
+    assert_eq!(walk(), None);
+}
+
+/// The mode rides in the permission manager, so only a round trip through the
+/// meta proves a resumed session comes back in the mode it was left in.
+#[test]
+fn a_session_remembers_the_mode_the_user_switched_to() {
+    let mut app = app_with_modes(None);
+    app.execute_command(cmd(&format!("/permission {MODE_AUTO}")), 0);
+    let session = app.blank_session().session;
+    assert_eq!(session.meta.permission_mode.as_deref(), Some(MODE_AUTO));
+
+    let reopened = spawned_app(app.blank_session(), permissions_with_modes(None));
+    assert_eq!(
+        reopened.permissions.active_mode_name().as_deref(),
+        Some(MODE_AUTO),
+        "the mode the tab was in is the mode the new one opens in"
+    );
+}
+
+/// `--permission-mode` is a property of the invocation, like `--yolo`: a fresh
+/// session has no answer of its own, so the flag still speaks for it. Switching
+/// off by hand is an answer, and it outlives the flag.
+#[test]
+fn a_seeded_mode_survives_a_session_with_no_answer_of_its_own() {
+    let app = app_with_modes(Some(MODE_AUTO));
+    assert_eq!(
+        app.permissions.active_mode_name().as_deref(),
+        Some(MODE_AUTO),
+        "a fresh session's empty meta does not read as off"
+    );
+    assert_eq!(
+        app.blank_session().session.meta.permission_mode,
+        None,
+        "and the flag is not written into the log"
+    );
+
+    let mut app = app_with_modes(Some(MODE_AUTO));
+    app.execute_command(cmd("/permission off"), 0);
+    let off = app.blank_session();
+    assert_eq!(off.session.meta.permission_mode.as_deref(), Some(MODE_OFF));
+    let reopened = spawned_app(off, permissions_with_modes(Some(MODE_AUTO)));
+    assert_eq!(
+        reopened.permissions.active_mode_name(),
+        None,
+        "switching off sticks, whatever the flag said"
+    );
+}
+
+/// A mode the config dropped since must not come back from a session log.
+#[test]
+fn a_mode_the_config_no_longer_defines_is_dropped_on_restore() {
+    let app = app_with_modes(Some(MODE_AUTO));
+    let mut open = app.blank_session();
+    open.session.meta.permission_mode = Some("gone".to_owned());
+    let reopened = spawned_app(open, permissions_with_modes(None));
+    assert_eq!(reopened.permissions.active_mode_name(), None);
 }
 
 /// A setting written into the meta but never read back still opens the tab
@@ -969,7 +1123,10 @@ fn a_spawned_tab_honours_the_yolo_turned_off_under_the_flag() {
 
     app.permissions.toggle_yolo();
     let session = app.blank_session();
-    assert_eq!(session.session.meta.yolo, Some(false));
+    assert_eq!(
+        session.session.meta.permission_mode.as_deref(),
+        Some(MODE_OFF)
+    );
 
     let spawned = spawned_app(session, Arc::new(prototype.fork()));
 
@@ -3617,50 +3774,85 @@ fn yolo_toggle() {
 fn checkpoint_mirrors_the_yolo_toggle_into_meta() {
     let mut app = test_app();
     app.checkpoint();
-    assert_eq!(app.state.session.meta.yolo, None);
+    assert_eq!(app.state.session.meta.permission_mode, None);
 
     app.execute_command(cmd("/yolo"), 0);
     app.checkpoint();
-    assert_eq!(app.state.session.meta.yolo, Some(true));
+    assert_eq!(
+        app.state.session.meta.permission_mode.as_deref(),
+        Some(BUILTIN_MODE_YOLO)
+    );
 
     app.execute_command(cmd("/yolo"), 0);
     app.checkpoint();
-    assert_eq!(app.state.session.meta.yolo, Some(false));
+    assert_eq!(
+        app.state.session.meta.permission_mode.as_deref(),
+        Some(MODE_OFF)
+    );
 }
 
-fn session_with_yolo(stored: Option<bool>) -> AppSession {
+fn session_with_mode(stored: Option<&str>) -> AppSession {
     let mut session = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
-    session.meta.yolo = stored;
+    session.meta.permission_mode = stored.map(str::to_owned);
     session.push_message(Message::user(RESUMED_PROMPT.into()));
     session
+}
+
+/// A session written before yolo became a mode still comes back in it. The old
+/// field is read and not written, so the next checkpoint moves the answer over.
+#[test_case(Some(true)  => (true,  Some(BUILTIN_MODE_YOLO.to_owned())) ; "stored_on_becomes_the_yolo_mode")]
+#[test_case(Some(false) => (false, Some(MODE_OFF.to_owned()))          ; "stored_off_stays_off")]
+#[test_case(None        => (false, None)                               ; "nothing_stored_asks_as_before")]
+fn a_session_from_before_modes_keeps_its_yolo(stored: Option<bool>) -> (bool, Option<String>) {
+    let mut legacy = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
+    legacy.meta.yolo = stored;
+    legacy.push_message(Message::user(RESUMED_PROMPT.into()));
+    let mut app = spawned_app(tmp_tab(legacy), test_permissions(false));
+
+    app.restore_resumed_session();
+    app.checkpoint();
+    assert_eq!(
+        app.state.session.meta.yolo, None,
+        "the legacy field is not written back"
+    );
+    (
+        app.permissions.is_yolo(),
+        app.state.session.meta.permission_mode.clone(),
+    )
 }
 
 /// The restored permissions, then what the next checkpoint writes back. Both
 /// matter: `--yolo` and `always_yolo` are properties of the invocation, so a
 /// resume under the flag must neither mark an untouched session nor erase the
 /// intent a marked one already carries.
-#[test_case(false, None        => (false, None)        ; "no_flag_and_nothing_stored_stays_off")]
-#[test_case(true,  None        => (true,  None)        ; "the_flag_applies_without_marking_the_session")]
-#[test_case(false, Some(true)  => (true,  Some(true))  ; "stored_on_comes_back_without_the_flag")]
-#[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
-#[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
-fn resume_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option<bool>) {
-    let mut app = spawned_app(tmp_tab(session_with_yolo(stored)), test_permissions(seed));
+#[test_case(false, None                     => (false, None)        ; "no_flag_and_nothing_stored_stays_off")]
+#[test_case(true,  None                     => (true,  None)        ; "the_flag_applies_without_marking_the_session")]
+#[test_case(false, Some(BUILTIN_MODE_YOLO)  => (true,  stored_yolo()) ; "stored_on_comes_back_without_the_flag")]
+#[test_case(true,  Some(BUILTIN_MODE_YOLO)  => (true,  stored_yolo()) ; "the_flag_does_not_wipe_stored_on")]
+#[test_case(true,  Some(MODE_OFF)           => (false, stored_off())  ; "stored_off_overrides_the_flag")]
+fn resume_applies_the_stored_mode(seed: bool, stored: Option<&str>) -> (bool, Option<String>) {
+    let mut app = spawned_app(tmp_tab(session_with_mode(stored)), test_permissions(seed));
 
     app.restore_resumed_session();
     app.checkpoint();
-    (app.permissions.is_yolo(), app.state.session.meta.yolo)
+    (
+        app.permissions.is_yolo(),
+        app.state.session.meta.permission_mode.clone(),
+    )
 }
 
 /// `focus_session` sends the same key press down this path instead of a fresh
 /// runtime whenever the focused tab is blank and idle, so it has to reach the
 /// same permissions as `resume_applies_stored_yolo`.
-#[test_case(false, None        => (false, None)        ; "no_flag_and_nothing_stored_stays_off")]
-#[test_case(true,  None        => (true,  None)        ; "the_flag_applies_without_marking_the_session")]
-#[test_case(false, Some(true)  => (true,  Some(true))  ; "stored_on_comes_back_without_the_flag")]
-#[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
-#[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
-fn loading_a_session_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option<bool>) {
+#[test_case(false, None                    => (false, None)         ; "no_flag_and_nothing_stored_stays_off")]
+#[test_case(true,  None                    => (true,  None)         ; "the_flag_applies_without_marking_the_session")]
+#[test_case(false, Some(BUILTIN_MODE_YOLO) => (true,  stored_yolo()) ; "stored_on_comes_back_without_the_flag")]
+#[test_case(true,  Some(BUILTIN_MODE_YOLO) => (true,  stored_yolo()) ; "the_flag_does_not_wipe_stored_on")]
+#[test_case(true,  Some(MODE_OFF)          => (false, stored_off())  ; "stored_off_overrides_the_flag")]
+fn loading_a_session_applies_the_stored_mode(
+    seed: bool,
+    stored: Option<&str>,
+) -> (bool, Option<String>) {
     let mut app = spawned_app(
         tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
         test_permissions(seed),
@@ -3668,22 +3860,26 @@ fn loading_a_session_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (b
     let model = app.state.model.clone();
 
     app.apply_loaded_session(
-        OpenSession::claimed(session_with_yolo(stored), &app.storage),
+        OpenSession::claimed(session_with_mode(stored), &app.storage),
         &model,
     );
     app.checkpoint();
-    (app.permissions.is_yolo(), app.state.session.meta.yolo)
+    (
+        app.permissions.is_yolo(),
+        app.state.session.meta.permission_mode.clone(),
+    )
 }
 
 /// A tab keeps one permission manager for its whole life, so without an
 /// explicit reset `/new` would carry the rules the user allowed last time into
 /// a session nobody granted them for. The yolo toggle is not one of those. The
 /// user set it, like the mode, so it rides along and only the grants go.
-#[test_case(false => (true,  Some(true))  ; "a_fresh_session_keeps_the_toggle_on")]
-#[test_case(true  => (false, Some(false)) ; "a_fresh_session_keeps_the_toggle_off")]
-fn resetting_the_session_drops_what_the_last_one_was_granted(seed: bool) -> (bool, Option<bool>) {
+#[test_case(false => (true,  stored_yolo()) ; "a_fresh_session_keeps_the_toggle_on")]
+#[test_case(true  => (false, stored_off())  ; "a_fresh_session_keeps_the_toggle_off")]
+fn resetting_the_session_drops_what_the_last_one_was_granted(seed: bool) -> (bool, Option<String>) {
+    let stored = if seed { MODE_OFF } else { BUILTIN_MODE_YOLO };
     let mut app = spawned_app(
-        tmp_tab(session_with_yolo(Some(!seed))),
+        tmp_tab(session_with_mode(Some(stored))),
         test_permissions(seed),
     );
     app.permissions.load_session_rules(vec![session_rule()]);
@@ -3694,7 +3890,10 @@ fn resetting_the_session_drops_what_the_last_one_was_granted(seed: bool) -> (boo
 
     assert!(app.permissions.session_rules_snapshot().is_empty());
     assert!(app.state.session.meta.session_rules.is_empty());
-    (app.permissions.is_yolo(), app.state.session.meta.yolo)
+    (
+        app.permissions.is_yolo(),
+        app.state.session.meta.permission_mode.clone(),
+    )
 }
 
 #[test]

@@ -11,7 +11,7 @@ use color_eyre::eyre::Context;
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
-use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
+use maki_config::{BUILTIN_MODE_YOLO, Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
@@ -99,8 +99,19 @@ fn load_config(
         .context("invalid config")?;
     config.permissions = load_permissions(project_config);
 
+    // `--yolo` is the oldest spelling of "start in the yolo mode", and naming a
+    // mode outranks it: it says which one, not just that there is one.
     if cli.yolo || config.always_yolo {
-        config.permissions.yolo = true;
+        config.permissions.initial_mode = Some(BUILTIN_MODE_YOLO.to_owned());
+    }
+    // In SDK mode the flag carries the wire's own four names, which only
+    // `sdk_mode` can translate. Everywhere else it names a mode, and
+    // `Config::validate` answers for a name nobody defined.
+    let flag = (!cli.is_sdk_mode())
+        .then_some(cli.permission_mode.as_deref())
+        .flatten();
+    if let Some(name) = flag.or(config.always_permission_mode.as_deref()) {
+        config.permissions.initial_mode = Some(name.to_owned());
     }
     if !cli.allowed_tools.is_empty() {
         config.agent.allowed_tools = cli

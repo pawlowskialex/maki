@@ -2256,6 +2256,10 @@ impl LuaRuntime {
         });
         registry.set_agent_hook(crate::hook::SlotHook {
             tx: tx.clone(),
+            layered: Arc::clone(&layered),
+        });
+        registry.set_permission_hook(crate::hook::SlotHook {
+            tx: tx.clone(),
             layered,
         });
         lua.set_app_data(KeymapStore::new());

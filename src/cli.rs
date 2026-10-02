@@ -128,7 +128,9 @@ pub struct Cli {
     #[arg(long)]
     pub append_system_prompt: Option<String>,
 
-    /// Permission mode for SDK
+    /// Permission mode to start in: a `[modes.*]` name from permissions.toml, or
+    /// a built-in (`accept_edits`, `yolo`). In SDK mode it also takes the wire's
+    /// own names (`default`, `acceptEdits`, `plan`, `bypassPermissions`)
     #[arg(long)]
     pub permission_mode: Option<String>,
 

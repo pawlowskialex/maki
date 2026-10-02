@@ -94,6 +94,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         bang: false,
     },
     BuiltinCommand {
+        name: "/permission",
+        description: "Switch permission mode (no args lists them, `off` turns it off)",
+        max_args: 1,
+        bang: false,
+    },
+    BuiltinCommand {
         name: "/yolo",
         description: "Toggle YOLO mode (skip all permission prompts)",
         max_args: 0,

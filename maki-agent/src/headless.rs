@@ -256,7 +256,10 @@ pub struct InteractiveParams {
     pub claim: SessionClaim,
     /// See [`HeadlessParams::storage`].
     pub storage: StateDir,
-    pub yolo: bool,
+    /// The permission mode this session starts in, by name. It beats whatever
+    /// the config's own `initial_mode` named, because it comes from the host
+    /// that is driving this run.
+    pub permission_mode: Option<String>,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
     /// The `always_*` knobs. `workflow` picks the tool catalog here; the rest
@@ -312,7 +315,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mut permissions_config = params.permissions_config;
-    permissions_config.yolo |= params.yolo;
+    if params.permission_mode.is_some() {
+        permissions_config.initial_mode = params.permission_mode;
+    }
     let permissions = Arc::new(PermissionManager::new(
         permissions_config,
         params.initial_wd,

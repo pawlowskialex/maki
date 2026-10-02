@@ -5,13 +5,23 @@ use color_eyre::Result;
 use color_eyre::eyre::Context;
 
 use maki_agent::tools::ToolRegistry;
-use maki_config::load_env_files;
 use maki_config::project::{self, TrustMode};
+use maki_config::{BUILTIN_MODE_YOLO, Config, load_env_files};
 use maki_lua::{InitFiles, PluginHost};
 use maki_storage::StateDir;
 
 use crate::provider_scripts;
 use crate::setup;
+
+/// `--yolo` and `always_yolo` name the mode of the same name, and an explicit
+/// `always_permission_mode` outranks both: it says which mode, not just that
+/// there is one.
+fn startup_mode(yolo: bool, config: &Config) -> Option<String> {
+    config
+        .always_permission_mode
+        .clone()
+        .or_else(|| (yolo || config.always_yolo).then(|| BUILTIN_MODE_YOLO.to_owned()))
+}
 
 pub fn run(
     model_arg: Option<String>,
@@ -66,13 +76,14 @@ pub fn run(
     let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
 
     let event_handle = plugin_host.event_handle();
+    let permission_mode = startup_mode(yolo, &config);
     maki_acp::run(maki_acp::AcpParams {
         model,
         config: config.agent,
         timeouts,
         initial_wd: cwd,
         prompt_slots: Arc::new(prompt_slots),
-        yolo: yolo || config.always_yolo,
+        permission_mode,
         defaults: config.session_defaults,
         model_policy: Arc::new(config.provider.model_policy.clone()),
         plugin_rules: plugin_host.plugin_rules(),

@@ -25,7 +25,8 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * Philosophy of not hiding anything - while other coding agents hide information as models improve (e.g. not showing number of lines read), maki leaves you in control.
 * UI fits everything well on my small screen laptop.
 * Full visibility of subagents - each subagent gets their own "chat window" you can easily navigate between using `/tasks` (Ctrl-X).
-* Sensible permission system - when the agent runs `git diff && rm -rf /`, what do you think will happen in your current coding agent? It will treat it as `git *`. Maki uses tree-sitter to parse the bash command and figure out the permissions requested are `git *` and `rm *`. Disable using `--yolo`.
+* Sensible permission system - when the agent runs `git diff && rm -rf /`, what do you think will happen in your current coding agent? It will treat it as `git *`. Maki uses tree-sitter to parse the bash command and figure out the permissions requested are `git *` and `rm *`. Disable using `--yolo`, which is itself just the built-in `yolo` permission mode.
+* Permission modes you write yourself - a `[modes.auto]` section in `permissions.toml` is a bundle of rules you switch on with `/permission auto` or Shift-Tab, with an optional per-turn budget. A plugin can answer the prompt in your place through the `permission.decide` slot.
 * SSRF protection on `webfetch` calls.
 * A `memory` tool to keep long term context, just tell maki to remember something (sometimes it uses it automatically). Managed via `/memory` (view / edit / delete memories).
 * Fuzzy search with Ctrl-F.

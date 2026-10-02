@@ -22,7 +22,14 @@ pub(crate) const HOST_PREFIX: &str = "tool.";
 /// over, and the points the agent loop fires itself.
 pub(crate) const UI_PREFIX: &str = "ui.";
 pub(crate) const AGENT_PREFIX: &str = "agent.";
-const HOST_PREFIXES: [&str; 3] = [HOST_PREFIX, UI_PREFIX, AGENT_PREFIX];
+/// The permission gate's own point. It is not under `agent.` because it fires
+/// per call rather than per turn, and a layer on it answers for the user.
+pub(crate) const PERMISSION_PREFIX: &str = "permission.";
+const HOST_PREFIXES: [&str; 4] = [HOST_PREFIX, UI_PREFIX, AGENT_PREFIX, PERMISSION_PREFIX];
+/// Fired when the rules leave a call for the user to answer. A layer that
+/// answers in their place grants what the prompt would have granted, so it
+/// costs every permission.
+pub(crate) const DECIDE_SLOT: &str = "permission.decide";
 /// `tool.*.input` wraps every call, whichever tool it names.
 pub(crate) const ANY_TOOL: &str = "*";
 
@@ -110,7 +117,10 @@ impl SlotStore {
             if let Some((tool, stage)) = host_slot_target(name) {
                 stages[stage as usize].insert(Arc::from(tool));
             }
-            if name.starts_with(UI_PREFIX) || name.starts_with(AGENT_PREFIX) {
+            if name.starts_with(UI_PREFIX)
+                || name.starts_with(AGENT_PREFIX)
+                || name.starts_with(PERMISSION_PREFIX)
+            {
                 surfaces.insert(Arc::from(name.as_str()));
             }
         }

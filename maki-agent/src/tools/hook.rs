@@ -86,8 +86,8 @@ pub enum Verdict {
     Unchanged,
     Replaced(Value),
     Denied(String),
-    /// Show the call to the user whatever the rules and yolo say, with
-    /// `reason` on the prompt. It can only make things stricter, so a deny
+    /// Show the call to the user whatever the rules and the active mode say,
+    /// with `reason` on the prompt. It can only make things stricter, so a deny
     /// rule still wins. `input` is a rewrite that came along, if any. Only
     /// [`HookStage::Input`] may ask, and everywhere else this reads as
     /// [`Verdict::Unchanged`].
@@ -95,6 +95,44 @@ pub enum Verdict {
         reason: String,
         input: Option<Value>,
     },
+}
+
+/// What a [`PermissionHook`] answered. It stands in for the prompt, so it is
+/// asked only about a call the rules left for the user, and only when no layer
+/// escalated that call: an escalation is someone asking for the human, which no
+/// decider may answer on their behalf.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub enum Decision {
+    /// Nobody had an opinion. The user is asked, as they would have been.
+    #[default]
+    Fallthrough,
+    Allow,
+    Deny(Option<String>),
+    /// Ask the user, with `reason` on the prompt.
+    Prompt(Option<String>),
+}
+
+pub struct PermissionCall<'a> {
+    pub tool: &'a str,
+    pub scopes: &'a [String],
+    /// The permission mode that was active, if any.
+    pub mode: Option<&'a str>,
+    /// Calls the mode has waved through this turn, and its ceiling.
+    pub auto_calls: u32,
+    pub max_auto_calls: Option<u32>,
+    pub cancel: &'a CancelToken,
+    pub deadline: Instant,
+}
+
+/// Whoever may answer a permission prompt in the user's place. Granting is a
+/// privilege no input layer has, which is why this is a stage of its own with
+/// a price of its own: see [`Authority::Unbounded`].
+pub trait PermissionHook: Send + Sync + 'static {
+    /// Sync and allocation free: a chain nobody wrapped costs one lookup, and
+    /// every gated call asks.
+    fn wraps(&self) -> bool;
+
+    fn run<'a>(&'a self, call: &'a PermissionCall<'a>) -> BoxFuture<'a, Decision>;
 }
 
 pub trait ToolHook: Send + Sync + 'static {

@@ -24,6 +24,7 @@ Type `/` in the input box to open the command palette.
 | `/login` | Authenticate with an LLM provider |
 | `/cd` | Change working directory |
 | `/btw` | Ask a quick question (no tools, no history pollution) |
+| `/permission` | Switch permission mode (no args lists them, `off` turns it off) |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |
 | `/fast` | Toggle fast mode (Anthropic Opus or Codex subscription models) |
 | `/workflow` | Toggle workflow mode (task callable inside code_execution) |
@@ -44,7 +45,8 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 
 ## Modes and toggles
 
-- **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`.
+- **`/permission`**: switch [permission mode](/docs/permissions/#permission-modes), the named rule bundles you write in `permissions.toml`. Bare it lists them, `off` goes back to asking, and `Shift+Tab` cycles. The mode survives a resume, and `--permission-mode` only sets the starting value. Config: `always_permission_mode`.
+- **`/yolo`**: the one-key gesture for the built-in `yolo` mode, which skips permission prompts (deny rules still apply). The answer survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`.
 - **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker of the effort levels with what each one costs in tokens; `Enter` applies the selected level and `Esc` closes without changing anything. With an argument it sets the level directly: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`.
 - **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.

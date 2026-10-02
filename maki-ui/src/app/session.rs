@@ -6,10 +6,12 @@ use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::Action;
 use crate::components::rewind_picker::RewindEntry;
+use maki_config::{BUILTIN_MODE_YOLO, MODE_OFF};
 use maki_lua::SessionEndReason;
 use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredMode, StoredSubagent};
+use tracing::warn;
 
 use crate::{AppSession, OpenSession};
 
@@ -37,6 +39,15 @@ pub(super) struct Sent {
 /// every tab that had one showed up in the picker as another empty session.
 pub(crate) fn session_has_content(session: &AppSession) -> bool {
     !session.messages().is_empty()
+}
+
+/// What a session written before modes existed says about its mode. The old
+/// field carried the same three answers: on, off by hand, and never asked.
+fn legacy_yolo(meta: &SessionMeta) -> Option<&'static str> {
+    match meta.yolo? {
+        true => Some(BUILTIN_MODE_YOLO),
+        false => Some(MODE_OFF),
+    }
 }
 
 impl App {
@@ -136,7 +147,8 @@ impl App {
             thinking: Some(state.thinking.into()),
             fast: state.fast_intent(),
             workflow: state.workflow,
-            yolo: self.permissions.persisted_yolo(),
+            yolo: None,
+            permission_mode: self.permissions.persisted_mode(),
         }
     }
 
@@ -276,13 +288,17 @@ impl App {
     /// The one funnel from a session's meta to the manager that enforces it,
     /// `App::new` included. A tab keeps one manager while sessions come and go
     /// under it, and a new tab forks the prototype the process started with, so
-    /// whoever takes a session has to state its answer in full, rules and yolo
+    /// whoever takes a session has to state its answer in full, rules and mode
     /// both, or it runs on what the last one was granted. A session that stored
-    /// no yolo falls back to `--yolo` and `always_yolo`.
+    /// no mode falls back to `--permission-mode` and `always_permission_mode`.
     pub(super) fn apply_stored_permissions(&self, meta: &SessionMeta) {
         self.permissions
             .load_session_rules(stored_to_rules(&meta.session_rules));
-        self.permissions.set_session_yolo(meta.yolo);
+        let stored = meta.permission_mode.as_deref().or(legacy_yolo(meta));
+        if let Err(e) = self.permissions.set_session_mode(stored) {
+            warn!(error = %e, "session asked for a permission mode this config does not define");
+            let _ = self.permissions.set_mode(None);
+        }
     }
 
     /// Resume at process start: the agent was already spawned with this
@@ -328,7 +344,8 @@ impl App {
             context_size: 0,
             input_draft: None,
             queued_messages: Vec::new(),
-            yolo: self.permissions.persisted_yolo(),
+            yolo: None,
+            permission_mode: self.permissions.persisted_mode(),
         };
         open
     }

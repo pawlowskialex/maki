@@ -27,7 +27,9 @@ use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, InputSource,
     PermissionsConfig, SessionEndReason, SessionEvents, SteerKind,
 };
-use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use maki_config::{
+    BUILTIN_MODE_ACCEPT_EDITS, BUILTIN_MODE_YOLO, ModelPolicy, ProjectConfig, SessionDefaults,
+};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
@@ -75,12 +77,13 @@ enum PermissionMode {
 }
 
 impl PermissionMode {
+    /// A name that is none of the four is a mode from the user's own config,
+    /// which the gate resolved before this runs and
+    /// [`maki_config::Config::validate`] refused if nobody defined it. On the
+    /// wire such a run is `default`.
     fn resolve(flag: Option<&str>, yolo: bool) -> Self {
         match flag {
-            Some(s) => Self::parse(s).unwrap_or_else(|| {
-                eprintln!("warning: unknown permission mode '{s}', using default");
-                Self::Default
-            }),
+            Some(s) => Self::parse(s).unwrap_or(Self::Default),
             None if yolo => Self::BypassPermissions,
             None => Self::Default,
         }
@@ -105,12 +108,39 @@ impl PermissionMode {
         }
     }
 
+    /// The permission mode maki switches on for this wire name. `plan` is the
+    /// one that names no mode: it is a mode of the agent, which `AgentMode`
+    /// carries.
+    fn maki_mode(self) -> Option<String> {
+        match self {
+            Self::AcceptEdits => Some(BUILTIN_MODE_ACCEPT_EDITS.to_owned()),
+            Self::BypassPermissions => Some(BUILTIN_MODE_YOLO.to_owned()),
+            Self::Default | Self::Plan => None,
+        }
+    }
+
     fn agent_mode(self, cwd: &Path) -> AgentMode {
         match self {
             Self::Plan => AgentMode::Plan(cwd.join("plan.md")),
             _ => AgentMode::Build,
         }
     }
+}
+
+/// A flag value that is none of the four wire names is a mode from the user's
+/// own config. The shared config path leaves `--permission-mode` alone in SDK
+/// mode, because the wire vocabulary is translated here and nowhere else, so
+/// this is also where a name nobody defined gets reported.
+fn user_mode(cli: &Cli, permissions: &PermissionsConfig) -> Option<String> {
+    let name = cli.permission_mode.as_deref()?;
+    if PermissionMode::parse(name).is_some() {
+        return None;
+    }
+    if permissions.mode(name).is_none() {
+        eprintln!("warning: no permission mode named '{name}', prompting as usual");
+        return None;
+    }
+    Some(name.to_owned())
 }
 
 #[derive(Serialize)]
@@ -560,6 +590,9 @@ pub fn run(params: SdkParams) -> Result<()> {
         config.max_turns = Some(max);
     }
     let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
+    let startup_mode = permission_mode
+        .maki_mode()
+        .or_else(|| user_mode(&cli, &permissions_config));
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
@@ -583,7 +616,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         resumed,
         claim,
         storage,
-        yolo: permission_mode == PermissionMode::BypassPermissions,
+        permission_mode: startup_mode,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         defaults,
@@ -846,6 +879,9 @@ fn handle_control_request(
             match mode_str.and_then(PermissionMode::parse) {
                 Some(mode) => {
                     shared.lock().unwrap().permission_mode = mode;
+                    if let Err(e) = handle.permissions.set_mode(mode.maki_mode().as_deref()) {
+                        warn!(error = %e, "set_permission_mode named a mode this config does not define");
+                    }
                     writer.emit_control_response(&cr.request_id, ok, None)
                 }
                 None => writer.emit_control_response(
