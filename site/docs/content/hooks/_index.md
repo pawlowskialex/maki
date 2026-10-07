@@ -346,8 +346,15 @@ opinion" without having to know what maki would have done. Replace it to decide:
 local ALLOWED = { ["cargo test"] = true, ["cargo check"] = true }
 
 maki.api.set_slot("permission.decide", function(prev, decision, ctx)
-  if ctx.tool == "bash" and ALLOWED[ctx.scopes[1]] then
+  if ctx.tool == "bash" and ctx.trusted and ALLOWED[ctx.input.command] then
     return { effect = "allow" }
+  end
+  if ctx.tool == "bash" and ctx.input.command:find("git push", 1, true) then
+    return {
+      effect = "prompt",
+      reason_code = "remote_mutation",
+      reason = "Pushes commits to a remote repository.",
+    }
   end
   if ctx.tool == "webfetch" then
     return { effect = "deny", reason = "Fetch through the proxy instead." }
@@ -357,8 +364,14 @@ end)
 ```
 
 `effect` is `"allow"`, `"deny"`, or `"prompt"`. On `deny` and `prompt`, `reason`
-is what the model reads or what the prompt shows. Returning `nil, reason` denies
-with that reason. An answer maki cannot read, a layer that throws, and a chain
+is what the model reads or what the prompt shows. `reason_code` is a short
+stable label such as `"remote_mutation"`. It stands in for a missing `reason`,
+and Maki logs it with the effect for every answer, so you can find a wrong
+call later without reproducing it. The log leaves out `input`. Returning
+`nil, reason` denies with that reason.
+
+An allow covers this one call. Maki stores no rule from it, so the next call is
+judged on its own. An answer maki cannot read, a layer that throws, and a chain
 that runs out of time all leave the prompt where it was: you are the fallback for
 everything this slot does not settle.
 
@@ -366,10 +379,19 @@ everything this slot does not settle.
 | --- | --- |
 | `tool` | tool name, `server.tool` for an MCP tool |
 | `scopes` | what the call asked for: commands for `bash`, paths for a write, the input as JSON for an MCP tool |
+| `input` | the arguments the tool runs with, exactly as it will get them, or `nil` for a gate no tool call reached |
+| `cwd` | the session's working directory, resolved. A `bash` call may set its own in `input.workdir` |
+| `project_root` | the root of the project Maki was started in |
+| `trusted` | whether you [trust](/docs/folder-trust/) that project |
 | `mode` | active [permission mode](/docs/permissions/#permission-modes), or `nil` |
 | `auto_calls` | calls the mode has waved through this turn |
 | `max_auto_calls` | the mode's ceiling, or `nil` |
 | `deadline_ms` | milliseconds left before the chain is dropped |
+
+Treat `input` as untrusted text. The model wrote it, and it can quote anything,
+including text that reads like an instruction to your plugin. Every other field
+comes from Maki. A layer that sends `input` to a model or service also sends any
+secret the call carries, so strip those first.
 
 Two limits keep this slot from being a way around the rules:
 

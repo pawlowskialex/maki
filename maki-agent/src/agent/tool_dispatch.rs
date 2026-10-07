@@ -833,7 +833,7 @@ async fn enforce_permission(
         ));
     }
     match (inv.permission_scopes().await, ask) {
-        (Some(scopes), ask) => gate(ctx, &ToolKey::native(name), &scopes, id, ask).await,
+        (Some(scopes), ask) => gate(ctx, &ToolKey::native(name), &scopes, id, input, ask).await,
         (None, Some(_)) => gate_on_input(ctx, &ToolKey::native(name), id, input, ask).await,
         (None, None) => Ok(()),
     }
@@ -844,6 +844,7 @@ async fn gate(
     tool: &ToolKey,
     scopes: &PermissionScopes,
     id: &str,
+    input: &Value,
     ask: Option<&str>,
 ) -> Result<(), String> {
     ctx.permissions
@@ -856,6 +857,7 @@ async fn gate(
                 request_id: id,
                 cancel: &ctx.cancel,
                 plan_path: ctx.mode.plan_path(),
+                input: Some(input),
                 ask,
                 decider: ctx.registry.permission_hook(),
             },
@@ -875,7 +877,7 @@ async fn gate_on_input(
     ask: Option<&str>,
 ) -> Result<(), String> {
     let scope = truncate_bytes(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
-    gate(ctx, tool, &PermissionScopes::single(scope), id, ask).await
+    gate(ctx, tool, &PermissionScopes::single(scope), id, input, ask).await
 }
 
 async fn execute_mcp_tool(

@@ -9,7 +9,8 @@ use std::time::Instant;
 use flume::Sender;
 use maki_agent::agent::{AgentCall, AgentHook, AgentSlot};
 use maki_agent::tools::hook::{
-    Authority, Decision, HookCall, HookStage, PermissionCall, PermissionHook, ToolHook, Verdict,
+    Authority, Decision, EFFECT_ALLOW, EFFECT_DENY, EFFECT_PROMPT, HookCall, HookStage,
+    PermissionCall, PermissionHook, Rationale, ToolHook, Verdict,
 };
 use maki_agent::tools::registry::BoxFuture;
 use serde_json::{Value, json};
@@ -26,9 +27,7 @@ const UNBOUNDED_SLOT_AUTHORITY: Authority = Authority::Unbounded;
 /// Fields of the decision table a [`PermissionHook`] layer answers with.
 const DECIDE_EFFECT: &str = "effect";
 const DECIDE_REASON: &str = "reason";
-const EFFECT_ALLOW: &str = "allow";
-const EFFECT_DENY: &str = "deny";
-const EFFECT_PROMPT: &str = "prompt";
+const DECIDE_REASON_CODE: &str = "reason_code";
 
 pub(crate) struct SlotHook {
     pub(crate) tx: Sender<Request>,
@@ -137,9 +136,15 @@ impl PermissionHook for SlotHook {
             // `prev` reads as "no opinion" without having to know what maki
             // would have done.
             value: json!({ DECIDE_EFFECT: EFFECT_PROMPT }),
+            // Maki's own facts sit at the top level, the model's words under
+            // `input`, so nothing the model wrote can pass for one of them.
             call: json!({
                 "tool": call.tool,
                 "scopes": call.scopes,
+                "input": call.input,
+                "cwd": call.cwd.to_string_lossy(),
+                "project_root": call.project_root.to_string_lossy(),
+                "trusted": call.trusted,
                 "mode": call.mode,
                 "auto_calls": call.auto_calls,
                 "max_auto_calls": call.max_auto_calls,
@@ -157,20 +162,22 @@ fn decision(verdict: Verdict) -> Decision {
     let value = match verdict {
         Verdict::Unchanged => return Decision::Fallthrough,
         Verdict::Denied(reason) | Verdict::Ask { reason, .. } => {
-            return Decision::Deny(Some(reason));
+            return Decision::Deny(Rationale {
+                reason: Some(reason),
+                code: None,
+            });
         }
         Verdict::Replaced(value) => value,
     };
-    let reason = || {
-        value
-            .get(DECIDE_REASON)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
+    let field = |key| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    let why = || Rationale {
+        reason: field(DECIDE_REASON),
+        code: field(DECIDE_REASON_CODE),
     };
     match value.get(DECIDE_EFFECT).and_then(Value::as_str) {
-        Some(EFFECT_ALLOW) => Decision::Allow,
-        Some(EFFECT_DENY) => Decision::Deny(reason()),
-        Some(EFFECT_PROMPT) => Decision::Prompt(reason()),
+        Some(EFFECT_ALLOW) => Decision::Allow(why()),
+        Some(EFFECT_DENY) => Decision::Deny(why()),
+        Some(EFFECT_PROMPT) => Decision::Prompt(why()),
         other => {
             tracing::warn!(
                 effect = ?other,
@@ -188,15 +195,27 @@ mod tests {
     use super::*;
 
     const REASON: &str = "not in this repo";
+    const CODE: &str = "outside_project";
+
+    fn because(reason: Option<&str>, code: Option<&str>) -> Rationale {
+        Rationale {
+            reason: reason.map(str::to_owned),
+            code: code.map(str::to_owned),
+        }
+    }
 
     #[test_case(Verdict::Unchanged => Decision::Fallthrough ; "no_opinion_asks_the_user")]
-    #[test_case(Verdict::Replaced(json!({ DECIDE_EFFECT: EFFECT_ALLOW })) => Decision::Allow ; "allow")]
-    #[test_case(Verdict::Replaced(json!({ DECIDE_EFFECT: EFFECT_PROMPT })) => Decision::Prompt(None) ; "prompt")]
+    #[test_case(Verdict::Replaced(json!({ DECIDE_EFFECT: EFFECT_ALLOW })) => Decision::Allow(because(None, None)) ; "allow")]
+    #[test_case(Verdict::Replaced(json!({ DECIDE_EFFECT: EFFECT_PROMPT })) => Decision::Prompt(because(None, None)) ; "prompt")]
     #[test_case(
         Verdict::Replaced(json!({ DECIDE_EFFECT: EFFECT_DENY, DECIDE_REASON: REASON }))
-        => Decision::Deny(Some(REASON.to_owned())) ; "deny_carries_its_reason"
+        => Decision::Deny(because(Some(REASON), None)) ; "deny_carries_its_reason"
     )]
-    #[test_case(Verdict::Denied(REASON.to_owned()) => Decision::Deny(Some(REASON.to_owned())) ; "stopping_the_chain_denies")]
+    #[test_case(
+        Verdict::Replaced(json!({ DECIDE_EFFECT: EFFECT_PROMPT, DECIDE_REASON: REASON, DECIDE_REASON_CODE: CODE }))
+        => Decision::Prompt(because(Some(REASON), Some(CODE))) ; "prompt_carries_its_code"
+    )]
+    #[test_case(Verdict::Denied(REASON.to_owned()) => Decision::Deny(because(Some(REASON), None)) ; "stopping_the_chain_denies")]
     // A table maki cannot read is not a grant: the user is the fallback for
     // every answer that does not say what it wants.
     #[test_case(Verdict::Replaced(json!({ DECIDE_EFFECT: "maybe" })) => Decision::Fallthrough ; "an_unknown_effect_asks_the_user")]

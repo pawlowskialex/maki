@@ -5,6 +5,7 @@
 //! on the [`Tool`](super::Tool) trait, so a tool is hookable because dispatch
 //! reached it, not because whoever wrote it remembered to ask.
 
+use std::path::Path;
 use std::time::Instant;
 
 use serde_json::Value;
@@ -17,6 +18,11 @@ use maki_config::Permission;
 /// Fields of the value a [`HookStage::Output`] hook sees and returns.
 pub const OUTPUT_TEXT: &str = "text";
 pub const OUTPUT_IS_ERROR: &str = "is_error";
+
+/// The effects a [`Decision`] goes by, wherever it is spelled out.
+pub const EFFECT_ALLOW: &str = "allow";
+pub const EFFECT_DENY: &str = "deny";
+pub const EFFECT_PROMPT: &str = "prompt";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum HookStage {
@@ -106,15 +112,53 @@ pub enum Decision {
     /// Nobody had an opinion. The user is asked, as they would have been.
     #[default]
     Fallthrough,
-    Allow,
-    Deny(Option<String>),
-    /// Ask the user, with `reason` on the prompt.
-    Prompt(Option<String>),
+    /// Good for this one call only: nothing is remembered, so the next call
+    /// is judged on its own.
+    Allow(Rationale),
+    Deny(Rationale),
+    /// Ask the user, with the rationale on the prompt.
+    Prompt(Rationale),
+}
+
+/// Why a decider answered the way it did. `reason` is prose for whoever reads
+/// the outcome (the model on a deny, the user on a prompt), `code` a stable
+/// label for the audit log, so a misjudged call can be found without
+/// reproducing it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Rationale {
+    pub reason: Option<String>,
+    pub code: Option<String>,
+}
+
+impl Decision {
+    /// The effect and why, or `None` when nobody had an opinion.
+    pub fn answered(&self) -> Option<(&'static str, &Rationale)> {
+        match self {
+            Self::Fallthrough => None,
+            Self::Allow(why) => Some((EFFECT_ALLOW, why)),
+            Self::Deny(why) => Some((EFFECT_DENY, why)),
+            Self::Prompt(why) => Some((EFFECT_PROMPT, why)),
+        }
+    }
+}
+
+impl Rationale {
+    /// What a reader is shown: the prose, or the code when that is all there is.
+    pub fn shown(self) -> Option<String> {
+        self.reason.or(self.code)
+    }
 }
 
 pub struct PermissionCall<'a> {
     pub tool: &'a str,
     pub scopes: &'a [String],
+    /// The input the tool was parsed from and will run with, so a decider
+    /// judges the call itself rather than what the scopes kept of it. `None`
+    /// when the gate was not reached from a tool call.
+    pub input: Option<&'a Value>,
+    pub cwd: &'a Path,
+    pub project_root: &'a Path,
+    pub trusted: bool,
     /// The permission mode that was active, if any.
     pub mode: Option<&'a str>,
     /// Calls the mode has waved through this turn, and its ceiling.

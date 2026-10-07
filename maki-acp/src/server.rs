@@ -1673,6 +1673,7 @@ mod tests {
                 request_id,
                 cancel: &CancelToken::none(),
                 plan_path: None,
+                input: None,
                 ask: None,
                 decider: None,
             },

