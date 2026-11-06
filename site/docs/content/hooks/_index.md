@@ -383,6 +383,8 @@ everything this slot does not settle.
 | `cwd` | the session's working directory, resolved. A `bash` call may set its own in `input.workdir` |
 | `project_root` | the root of the project Maki was started in |
 | `trusted` | whether you [trust](/docs/folder-trust/) that project |
+| `session_id` | the session the call serves, for [`maki.session.messages`](/docs/lua-api/#maki-session-messages), or `nil` with no session |
+| `task_id` | the spawning call's id inside a subagent, `nil` in the main agent. A subagent shares its parent's `session_id` |
 | `mode` | active [permission mode](/docs/permissions/#permission-modes), or `nil` |
 | `auto_calls` | calls the mode has waved through this turn |
 | `max_auto_calls` | the mode's ceiling, or `nil` |

@@ -172,12 +172,20 @@ pub struct Gate<'a> {
     pub plan_path: Option<&'a Path>,
     /// The input the call runs with, handed to the decider as is.
     pub input: Option<&'a Value>,
+    pub session_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
     /// A plugin's reason to show this call to the user whatever the rules say.
     /// See [`PermissionManager::check_escalated`].
     pub ask: Option<&'a str>,
     /// Whoever may answer the prompt in the user's place, when nothing
     /// escalated the call. `None` when no plugin layers the decide slot.
     pub decider: Option<InstalledPermissionHook>,
+}
+
+/// Which conversation a gated call serves, as the decider is told it.
+struct Conversation<'a> {
+    session_id: Option<&'a str>,
+    task_id: Option<&'a str>,
 }
 
 /// How squarely an approval names the tool being checked. Every source of
@@ -979,6 +987,8 @@ impl PermissionManager {
             cancel,
             plan_path,
             input,
+            session_id,
+            task_id,
             ask,
             decider,
         } = gate;
@@ -1014,7 +1024,12 @@ impl PermissionManager {
         // answers here never need the channel at all.
         let decided = match decider {
             Some(hook) if ask.is_none() => {
-                self.decide(&hook, &tool_string, &ps, input, cancel).await
+                let conversation = Conversation {
+                    session_id,
+                    task_id,
+                };
+                self.decide(&hook, &tool_string, &ps, input, conversation, cancel)
+                    .await
             }
             _ => Decision::Fallthrough,
         };
@@ -1095,6 +1110,7 @@ impl PermissionManager {
         tool: &str,
         scopes: &[String],
         input: Option<&Value>,
+        conversation: Conversation<'_>,
         cancel: &crate::CancelToken,
     ) -> Decision {
         let (auto_calls, max_auto_calls) = self.mode_spend();
@@ -1107,6 +1123,8 @@ impl PermissionManager {
             cwd: &cwd,
             project_root: self.project_config.config_root(),
             trusted: self.project_config.is_trusted(),
+            session_id: conversation.session_id,
+            task_id: conversation.task_id,
             mode: mode.as_deref(),
             auto_calls,
             max_auto_calls,
@@ -2578,6 +2596,8 @@ mod tests {
     const ASK_REASON: &str = "a layer wants the human";
     const DECIDE_CODE: &str = "remote_mutation";
     const PIPE_TO_SHELL: &str = "| sh";
+    const SESSION_ID: &str = "session-1";
+    const TASK_ID: &str = "toolu_task";
 
     /// Answers with one decision and counts what it was asked about.
     struct TestDecider {
@@ -2621,7 +2641,7 @@ mod tests {
         decider: Option<InstalledPermissionHook>,
         ask: Option<&str>,
     ) -> Result<(), PermissionError> {
-        enforce_input(mgr, decider, ask, None)
+        enforce_input(mgr, decider, ask, None, None)
     }
 
     fn enforce_input(
@@ -2629,6 +2649,7 @@ mod tests {
         decider: Option<InstalledPermissionHook>,
         ask: Option<&str>,
         input: Option<&Value>,
+        task_id: Option<&str>,
     ) -> Result<(), PermissionError> {
         let (guard, _events) = crate::event_stream();
         let event_tx = guard.sender(0);
@@ -2642,6 +2663,8 @@ mod tests {
                 cancel: &crate::CancelToken::none(),
                 plan_path: None,
                 input,
+                session_id: Some(SESSION_ID),
+                task_id,
                 ask,
                 decider,
             },
@@ -2703,7 +2726,21 @@ mod tests {
             }
         });
         let input = json!({ "command": format!("curl x {PIPE_TO_SHELL}") });
-        assert!(enforce_input(&mgr, Some(decider), None, Some(&input)).is_err());
+        assert!(enforce_input(&mgr, Some(decider), None, Some(&input), None).is_err());
+    }
+
+    /// A decider that reads what the user asked for has to know whose
+    /// conversation to read, and a subagent's call names its task beside it.
+    #[test]
+    fn a_decider_knows_which_conversation_it_serves() {
+        let mgr = default_mgr();
+        let (decider, _) = TestDecider::installed(|call| {
+            match call.session_id == Some(SESSION_ID) && call.task_id == Some(TASK_ID) {
+                true => Decision::Allow(Rationale::default()),
+                false => Decision::Deny(Rationale::default()),
+            }
+        });
+        assert!(enforce_input(&mgr, Some(decider), None, None, Some(TASK_ID)).is_ok());
     }
 
     /// An escalation is someone asking for the human, which no decider may

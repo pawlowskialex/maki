@@ -1674,6 +1674,8 @@ mod tests {
                 cancel: &CancelToken::none(),
                 plan_path: None,
                 input: None,
+                session_id: None,
+                task_id: None,
                 ask: None,
                 decider: None,
             },

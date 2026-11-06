@@ -159,6 +159,11 @@ pub struct PermissionCall<'a> {
     pub cwd: &'a Path,
     pub project_root: &'a Path,
     pub trusted: bool,
+    /// The conversation the call serves, so a decider can read what the user
+    /// asked for. A subagent shares its parent's session, and `task_id` tells
+    /// it apart.
+    pub session_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
     /// The permission mode that was active, if any.
     pub mode: Option<&'a str>,
     /// Calls the mode has waved through this turn, and its ceiling.

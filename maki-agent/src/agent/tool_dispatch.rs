@@ -858,6 +858,8 @@ async fn gate(
                 cancel: &ctx.cancel,
                 plan_path: ctx.mode.plan_path(),
                 input: Some(input),
+                session_id: ctx.session_id.as_ref().map(SessionRef::as_str),
+                task_id: ctx.task_id.as_deref(),
                 ask,
                 decider: ctx.registry.permission_hook(),
             },

@@ -145,6 +145,8 @@ impl PermissionHook for SlotHook {
                 "cwd": call.cwd.to_string_lossy(),
                 "project_root": call.project_root.to_string_lossy(),
                 "trusted": call.trusted,
+                "session_id": call.session_id,
+                "task_id": call.task_id,
                 "mode": call.mode,
                 "auto_calls": call.auto_calls,
                 "max_auto_calls": call.max_auto_calls,
